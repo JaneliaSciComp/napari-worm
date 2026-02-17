@@ -318,21 +318,25 @@ class WormAnnotator:
         layout = QHBoxLayout(nav_widget)
         layout.setContentsMargins(4, 4, 4, 4)
 
+        layout.addStretch()
         layout.addWidget(QLabel("Left t="))
         self._left_spin = QSpinBox()
         self._left_spin.setRange(0, max_t)
         self._left_spin.setValue(start)
+        self._left_spin.setFixedWidth(80)
         self._left_spin.valueChanged.connect(self._on_spinbox_changed)
         layout.addWidget(self._left_spin)
 
+        layout.addStretch()
         layout.addWidget(QLabel("Right t="))
         self._right_spin = QSpinBox()
         self._right_spin.setRange(0, max_t)
         self._right_spin.setValue(min(start + 1, max_t))
+        self._right_spin.setFixedWidth(80)
         self._right_spin.valueChanged.connect(self._on_spinbox_changed)
         layout.addWidget(self._right_spin)
 
-        layout.addWidget(QLabel(f"  (0–{max_t})"))
+        layout.addStretch()
 
         self.viewer.window.add_dock_widget(nav_widget, name='Navigation', area='bottom')
 
@@ -379,6 +383,7 @@ class WormAnnotator:
             img_layer = self.viewer.add_image(
                 vol, name=f'Volume t={ti} ({side_label})', colormap='gray',
                 rendering='mip', contrast_limits=self.contrast_limits,
+                multiscale=False,
             )
             pts_layer = self.viewer.add_points(
                 ndim=3, name=f'Annotations t={ti} ({side_label})', size=5,
