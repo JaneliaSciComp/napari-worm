@@ -22,6 +22,7 @@ import numpy as np
 import pandas as pd
 import tifffile
 from dask import delayed
+from qtpy.QtWidgets import QWidget, QHBoxLayout, QLabel, QSpinBox
 
 
 def load_volume(path: str | Path) -> np.ndarray:
@@ -36,10 +37,16 @@ def load_volume(path: str | Path) -> np.ndarray:
     return data
 
 
+def _numeric_sort_key(path: Path) -> list:
+    """Sort key that handles numbers naturally: Decon_reg_0, 1, 2, ..., 10, 11."""
+    import re
+    return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', path.name)]
+
+
 def scan_time_series(directory: str | Path) -> list[Path]:
-    """Find all TIFF files in a directory, sorted by name."""
+    """Find all TIFF files in a directory, sorted numerically."""
     directory = Path(directory)
-    filenames = sorted(directory.glob("*.tif"))
+    filenames = sorted(directory.glob("*.tif"), key=_numeric_sort_key)
     if not filenames:
         raise FileNotFoundError(f"No .tif files found in {directory}")
     print(f"Found {len(filenames)} timepoints in {directory.name}")
@@ -170,11 +177,12 @@ class WormAnnotator:
     """Main annotation tool class."""
 
     def __init__(self, volume_path: str | Path, annotations_path: str | Path | None = None,
-                 grid_mode: bool = True):
+                 grid_mode: bool = True, start_t: int = 0):
         self.volume_path = Path(volume_path)
         self.annotations_path = annotations_path
         self.is_time_series = self.volume_path.is_dir()
         self.use_grid = grid_mode and self.is_time_series
+        self.start_t = start_t
 
         # Create viewer
         self.viewer = napari.Viewer(ndisplay=3)
@@ -208,8 +216,7 @@ class WormAnnotator:
         if self.use_grid:
             print("  Right / ]   : Next timepoint pair")
             print("  Left  / [   : Previous timepoint pair")
-            print("  Ctrl+Z      : Undo last annotation (on active side)")
-            print("  Click model : Select left/right side for annotation")
+            print("  Ctrl+Z      : Undo last annotation (any side)")
         print("-------------------\n")
 
     # ---- Single file mode ----
@@ -289,16 +296,15 @@ class WormAnnotator:
     def _init_grid_mode(self):
         """Load two timepoints side by side in grid mode."""
         self.tiff_files = scan_time_series(self.volume_path)
-        self.current_t = 0
+        max_t = len(self.tiff_files) - 1
+        start = min(self.start_t, max_t - 1)
         # {timepoint_index: (N, 3) array of annotations}
         self.grid_annotations: dict[int, np.ndarray] = {}
-        # Per-side undo stacks: index 0 = left (t), index 1 = right (t+1)
-        self.grid_undo_stacks: list[list] = [[], []]
-        # Which side is active: 0 = left (t), 1 = right (t+1)
-        self.active_side: int = 0
+        # Global undo stack: list of (timepoint, points_layer) in order of actions
+        self.undo_stack: list[tuple[int, object]] = []
 
         # Load first pair and get contrast limits
-        first_vol = load_volume(self.tiff_files[0])
+        first_vol = load_volume(self.tiff_files[start])
         self.contrast_limits = [float(first_vol.min()), float(first_vol.max())]
 
         # Store references: index 0 = left (t), index 1 = right (t+1)
@@ -306,7 +312,31 @@ class WormAnnotator:
         self.grid_points_layers: list = []
         self.grid_timepoints: list[int] = []
 
-        self._load_grid_pair(self.current_t)
+        # Create navigation widget with two spinboxes
+        self._nav_updating = False  # flag to prevent feedback loops
+        nav_widget = QWidget()
+        layout = QHBoxLayout(nav_widget)
+        layout.setContentsMargins(4, 4, 4, 4)
+
+        layout.addWidget(QLabel("Left t="))
+        self._left_spin = QSpinBox()
+        self._left_spin.setRange(0, max_t)
+        self._left_spin.setValue(start)
+        self._left_spin.valueChanged.connect(self._on_spinbox_changed)
+        layout.addWidget(self._left_spin)
+
+        layout.addWidget(QLabel("Right t="))
+        self._right_spin = QSpinBox()
+        self._right_spin.setRange(0, max_t)
+        self._right_spin.setValue(min(start + 1, max_t))
+        self._right_spin.valueChanged.connect(self._on_spinbox_changed)
+        layout.addWidget(self._right_spin)
+
+        layout.addWidget(QLabel(f"  (0–{max_t})"))
+
+        self.viewer.window.add_dock_widget(nav_widget, name='Navigation', area='bottom')
+
+        self._load_grid_pair(start, min(start + 1, max_t))
 
         # Enable grid mode
         self.viewer.grid.enabled = True
@@ -319,12 +349,12 @@ class WormAnnotator:
         self.viewer.bind_key('[', self._grid_prev)
         self.viewer.bind_key('Control-z', self._undo_last_point)
 
-    def _load_grid_pair(self, t: int):
-        """Load timepoints t and t+1 into two grid panels.
+    def _load_grid_pair(self, t_left: int, t_right: int):
+        """Load two timepoints into the grid panels.
 
         Napari grid with stride=2: bottom of layer list = left cell.
-        So we add left side (t) first, then right side (t+1).
-        grid_image_layers/grid_points_layers are indexed [0=left/t, 1=right/t+1].
+        So we add left side first, then right side.
+        grid_image_layers/grid_points_layers are indexed [0=left, 1=right].
         """
         # Save current annotations before switching
         self._save_grid_annotations_to_cache()
@@ -335,17 +365,15 @@ class WormAnnotator:
                 self.viewer.layers.remove(layer)
         self.grid_image_layers.clear()
         self.grid_points_layers.clear()
-        self.grid_undo_stacks = [[], []]
 
-        t2 = min(t + 1, len(self.tiff_files) - 1)
-        self.grid_timepoints = [t, t2]
+        self.grid_timepoints = [t_left, t_right]
 
-        # Add left (t) first, then right (t+1)
+        # Add left first, then right
         # Bottom of layer list = left grid cell in napari
         image_layers_tmp = [None, None]
         points_layers_tmp = [None, None]
 
-        for side, ti in [(0, t), (1, t2)]:
+        for side, ti in [(0, t_left), (1, t_right)]:
             vol = load_volume(self.tiff_files[ti])
             side_label = "left" if side == 0 else "right"
             img_layer = self.viewer.add_image(
@@ -367,13 +395,6 @@ class WormAnnotator:
             # on either side works without needing to select in the sidebar.
             def make_click_handler(volume_data, side_idx, timepoint, img_layer_ref, points_layer):
                 def handler(layer, event):
-                    # Set this side as active
-                    self.active_side = side_idx
-                    # Select the image layer (not points) so Ctrl+Z keybinding
-                    # works and napari's built-in points undo doesn't interfere
-                    self.viewer.layers.selection.clear()
-                    self.viewer.layers.selection.add(img_layer_ref)
-                    # Ctrl+Click to add annotation
                     if 'Control' in event.modifiers:
                         self._on_click_grid(
                             img_layer_ref, event, volume_data, side_idx, timepoint, points_layer,
@@ -394,13 +415,19 @@ class WormAnnotator:
         self.viewer.layers.selection.clear()
         self.viewer.layers.selection.add(self.grid_image_layers[0])
 
+        # Update spinboxes (without triggering reload)
+        self._nav_updating = True
+        self._left_spin.setValue(t_left)
+        self._right_spin.setValue(t_right)
+        self._nav_updating = False
+
         # Update window title and text overlay with current timepoints
-        label = f"t={t}  |  t={t2}   (of {len(self.tiff_files) - 1})"
+        label = f"t={t_left}  |  t={t_right}   (of {len(self.tiff_files) - 1})"
         self.viewer.title = f"napari_worm — {label}"
         self.viewer.text_overlay.visible = True
         self.viewer.text_overlay.text = label
         self.viewer.text_overlay.font_size = 20
-        print(f"Showing timepoints t={t} (left) and t={t2} (right) of {len(self.tiff_files) - 1}")
+        print(f"Showing timepoints t={t_left} (left) and t={t_right} (right) of {len(self.tiff_files) - 1}")
 
     def _save_grid_annotations_to_cache(self):
         """Cache annotations from current grid points layers."""
@@ -410,23 +437,30 @@ class WormAnnotator:
                 if len(pts_layer.data) > 0:
                     self.grid_annotations[ti] = pts_layer.data.copy()
 
+    def _on_spinbox_changed(self, _value):
+        """Handle spinbox value changes — reload the grid pair."""
+        if self._nav_updating:
+            return
+        t_left = self._left_spin.value()
+        t_right = self._right_spin.value()
+        self._load_grid_pair(t_left, t_right)
+
     def _grid_next(self, viewer):
-        """Advance to next timepoint pair."""
-        if self.current_t + 1 >= len(self.tiff_files) - 1:
+        """Advance both timepoints by 1."""
+        t_left, t_right = self.grid_timepoints
+        max_t = len(self.tiff_files) - 1
+        if t_right >= max_t:
             print("Already at last timepoint")
             return
-        new_t = self.current_t + 1
-        self._load_grid_pair(new_t)
-        self.current_t = new_t
+        self._load_grid_pair(t_left + 1, t_right + 1)
 
     def _grid_prev(self, viewer):
-        """Go back to previous timepoint pair."""
-        if self.current_t <= 0:
+        """Go back both timepoints by 1."""
+        t_left, t_right = self.grid_timepoints
+        if t_left <= 0:
             print("Already at first timepoint")
             return
-        new_t = self.current_t - 1
-        self._load_grid_pair(new_t)
-        self.current_t = new_t
+        self._load_grid_pair(t_left - 1, t_right - 1)
 
     def _on_click_grid(self, layer, event, volume_data, side_idx, timepoint, points_layer):
         """Ctrl+Click handler for grid mode — adds annotation on the clicked side."""
@@ -442,26 +476,37 @@ class WormAnnotator:
 
         peak_pos = find_peak_along_ray(volume_data, near_point, far_point)
         points_layer.add(peak_pos)
-        self.grid_undo_stacks[side_idx].append(points_layer)
+        self.undo_stack.append((timepoint, points_layer))
         side_label = "left" if side_idx == 0 else "right"
         print(f"[t={timepoint} {side_label}] Added annotation at z={peak_pos[0]:.1f}, y={peak_pos[1]:.1f}, x={peak_pos[2]:.1f}")
 
     def _undo_last_point(self, viewer):
-        """Remove the last added annotation on the active side (Ctrl+Z)."""
-        side = self.active_side
-        ti = self.grid_timepoints[side] if side < len(self.grid_timepoints) else '?'
-        undo_stack = self.grid_undo_stacks[side]
-
-        if not undo_stack:
-            print(f"[t={ti}] Nothing to undo")
+        """Remove the last added annotation (Ctrl+Z). Works globally across sides."""
+        if not self.undo_stack:
+            print("Nothing to undo")
             return
 
-        pts_layer = undo_stack.pop()
-        if len(pts_layer.data) > 0:
+        timepoint, pts_layer = self.undo_stack.pop()
+
+        # If the points layer is still in the viewer (current pair), remove directly
+        if pts_layer in self.viewer.layers and len(pts_layer.data) > 0:
             pts_layer.data = pts_layer.data[:-1]
-            print(f"[t={ti}] Undid last annotation")
+            print(f"[t={timepoint}] Undid last annotation")
+        # If we navigated away, undo from the cached annotations
+        elif timepoint in self.grid_annotations and len(self.grid_annotations[timepoint]) > 0:
+            self.grid_annotations[timepoint] = self.grid_annotations[timepoint][:-1]
+            # Also update currently displayed layer if this timepoint is showing
+            for side, ti in enumerate(self.grid_timepoints):
+                if ti == timepoint and side < len(self.grid_points_layers):
+                    displayed_pts = self.grid_points_layers[side]
+                    if displayed_pts in self.viewer.layers:
+                        if len(self.grid_annotations[timepoint]) > 0:
+                            displayed_pts.data = self.grid_annotations[timepoint].copy()
+                        else:
+                            displayed_pts.data = np.empty((0, 3))
+            print(f"[t={timepoint}] Undid last annotation (cached)")
         else:
-            print(f"[t={ti}] Nothing to undo")
+            print(f"[t={timepoint}] Nothing to undo")
 
     # ---- Save / Run ----
 
@@ -528,10 +573,17 @@ def main():
         default=False,
         help="Use dask 4D slider instead of grid mode for directories",
     )
+    parser.add_argument(
+        "--start", "-s",
+        type=int,
+        default=0,
+        help="Starting timepoint index for grid mode (default: 0)",
+    )
 
     args = parser.parse_args()
 
-    annotator = WormAnnotator(args.volume, args.annotations, grid_mode=not args.no_grid)
+    annotator = WormAnnotator(args.volume, args.annotations, grid_mode=not args.no_grid,
+                              start_t=args.start)
     annotator.run()
 
 
