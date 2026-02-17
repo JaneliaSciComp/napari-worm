@@ -1,16 +1,12 @@
 """
 napari_worm: 3D Cell Annotation Tool for C. elegans
 
-Phase 1 MVP:
-- Load TIFF volumes
-- Ctrl+Click in 3D to place annotation at peak intensity
-- Save/load annotations as CSV
-
 Usage:
-    python napari_worm.py /path/to/volume.tif
-    python napari_worm.py /path/to/directory/            # grid mode: two timepoints side by side
-    python napari_worm.py /path/to/directory/ --no-grid   # dask mode: 4D slider
-    python napari_worm.py /path/to/volume.tif --annotations existing.csv
+    python napari_worm.py /path/to/volume.tif                    # single file
+    python napari_worm.py /path/to/directory/                     # dual view (grid mode)
+    python napari_worm.py /path/to/directory/ --start 100         # start at timepoint 100
+    python napari_worm.py /path/to/directory/ --no-grid           # dask 4D slider (fallback)
+    python napari_worm.py /path/to/volume.tif -a existing.csv     # load existing annotations
 """
 
 import argparse
