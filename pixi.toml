@@ -1,0 +1,19 @@
+[workspace]
+name = "napari_worm"
+version = "0.1.0"
+description = "3D cell annotation tool for C. elegans using Napari"
+authors = ["Diyi Chen <chend@janelia.hhmi.org>"]
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-arm64", "osx-64"]
+
+[dependencies]
+python = "=3.11"
+napari = ">=0.4.19"
+pyqt = ">=5.15"
+numpy = ">=1.26"
+pandas = ">=2.1"
+tifffile = ">=2024.1"
+zarr = ">=2.16"
+dask = ">=2024.1"
+matplotlib = ">=3.8"
+ipykernel = ">=6.31.0,<7"
