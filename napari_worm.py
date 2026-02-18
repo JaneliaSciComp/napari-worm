@@ -121,6 +121,86 @@ def find_peak_along_ray(data: np.ndarray, start: np.ndarray, end: np.ndarray) ->
     return positions[peak_idx]
 
 
+def gradient_ascent_3d(data: np.ndarray, seed: np.ndarray, max_steps: int = 50) -> np.ndarray:
+    """Walk uphill in 3D intensity to find the local maximum near seed.
+
+    Uses 6-connected neighbors (faces only) to avoid diagonal jumps on noisy data.
+    Converges to the same peak regardless of where on the nucleus the seed landed.
+
+    Returns:
+        Integer voxel position of the local intensity maximum (z, y, x)
+    """
+    shape = np.array(data.shape)
+    pos = np.clip(np.round(seed).astype(int), 0, shape - 1)
+
+    for _ in range(max_steps):
+        best_val = data[tuple(pos)]
+        best_pos = pos.copy()
+        for delta in [(-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1)]:
+            neighbor = pos + np.array(delta)
+            if np.all(neighbor >= 0) and np.all(neighbor < shape):
+                val = data[tuple(neighbor)]
+                if val > best_val:
+                    best_val = val
+                    best_pos = neighbor.copy()
+        if np.all(best_pos == pos):
+            break  # at local maximum
+        pos = best_pos
+
+    return pos.astype(float)
+
+
+def find_nucleus_centroid(data: np.ndarray, seed: np.ndarray, radius: int = 7,
+                          threshold_fraction: float = 0.5) -> np.ndarray:
+    """Refine a ray-peak to the true 3D center of a nucleus.
+
+    Two-step process:
+    1. Gradient ascent from seed → consistent local intensity maximum
+       (same peak regardless of where on the nucleus the ray entered)
+    2. Intensity-weighted centroid around that peak → sub-voxel center
+
+    Args:
+        data: 3D volume array
+        seed: Initial peak position (z, y, x) from ray picking
+        radius: Centroid sphere radius in voxels (default 7)
+        threshold_fraction: Fraction of peak value used as intensity cutoff
+
+    Returns:
+        Sub-voxel centroid position (z, y, x), or seed unchanged if fails
+    """
+    # Step 1: gradient ascent to consistent local max
+    local_max = gradient_ascent_3d(data, seed)
+    local_max_int = np.clip(local_max.astype(int), 0, np.array(data.shape) - 1)
+    peak_value = float(data[tuple(local_max_int)])
+
+    if peak_value == 0:
+        return seed
+
+    threshold = peak_value * threshold_fraction
+
+    # Step 2: centroid around the local max
+    z0 = max(0, local_max_int[0] - radius);  z1 = min(data.shape[0], local_max_int[0] + radius + 1)
+    y0 = max(0, local_max_int[1] - radius);  y1 = min(data.shape[1], local_max_int[1] + radius + 1)
+    x0 = max(0, local_max_int[2] - radius);  x1 = min(data.shape[2], local_max_int[2] + radius + 1)
+
+    zz, yy, xx = np.mgrid[z0:z1, y0:y1, x0:x1]
+    sub = data[z0:z1, y0:y1, x0:x1].astype(float)
+    dist_sq = (zz - local_max[0])**2 + (yy - local_max[1])**2 + (xx - local_max[2])**2
+
+    mask = (dist_sq <= radius**2) & (sub >= threshold)
+    if not np.any(mask):
+        return local_max
+
+    weights = sub[mask]
+    total = weights.sum()
+    centroid = np.array([
+        (zz[mask] * weights).sum() / total,
+        (yy[mask] * weights).sum() / total,
+        (xx[mask] * weights).sum() / total,
+    ])
+    return centroid
+
+
 def save_annotations(points: np.ndarray, filepath: str | Path):
     """Save annotation points to CSV.
 
@@ -243,6 +323,7 @@ class WormAnnotator:
             return
 
         peak_pos = find_peak_along_ray(self.data, near_point, far_point)
+        peak_pos = find_nucleus_centroid(self.data, peak_pos)
         self.points_layer.add(peak_pos)
         print(f"Added annotation at z={peak_pos[0]:.1f}, y={peak_pos[1]:.1f}, x={peak_pos[2]:.1f}")
 
@@ -281,6 +362,7 @@ class WormAnnotator:
         t = int(self.viewer.dims.current_step[0])
         volume_3d = np.asarray(self.data[t])
         peak_pos = find_peak_along_ray(volume_3d, near_point[-3:], far_point[-3:])
+        peak_pos = find_nucleus_centroid(volume_3d, peak_pos)
         peak_pos = np.concatenate([[t], peak_pos])
 
         self.points_layer.add(peak_pos)
@@ -390,16 +472,24 @@ class WormAnnotator:
             if ti in self.grid_annotations and len(self.grid_annotations[ti]) > 0:
                 pts_layer.data = self.grid_annotations[ti]
 
-            # Click handler: any click sets active side + selects image layer;
-            # Ctrl+Click also adds annotation.
-            # Registered on BOTH image and points layers so clicking anywhere
-            # on either side works without needing to select in the sidebar.
+            # Register Ctrl+Click handler on both image and points layers for this side.
+            # Screen-position routing ensures only the correct grid cell handles each click.
             def make_click_handler(volume_data, side_idx, timepoint, img_layer_ref, points_layer):
                 def handler(layer, event):
-                    if 'Control' in event.modifiers:
-                        self._on_click_grid(
-                            img_layer_ref, event, volume_data, side_idx, timepoint, points_layer,
-                        )
+                    if 'Control' not in event.modifiers:
+                        return
+                    # Route to the correct grid cell by screen x-position.
+                    # Grid mode shows two columns; left = x < canvas_width/2.
+                    try:
+                        canvas_w = self.viewer.window._qt_viewer.canvas.size[0]
+                    except AttributeError:
+                        canvas_w = self.viewer.window.qt_viewer.canvas.size[0]
+                    clicked_side = 0 if event.pos[0] < canvas_w / 2 else 1
+                    if clicked_side != side_idx:
+                        return
+                    self._on_click_grid(
+                        img_layer_ref, event, volume_data, side_idx, timepoint, points_layer,
+                    )
                 return handler
 
             click_handler = make_click_handler(vol, side, ti, img_layer, pts_layer)
@@ -476,6 +566,7 @@ class WormAnnotator:
             return
 
         peak_pos = find_peak_along_ray(volume_data, near_point, far_point)
+        peak_pos = find_nucleus_centroid(volume_data, peak_pos)
         points_layer.add(peak_pos)
         self.undo_stack.append((timepoint, points_layer))
         side_label = "left" if side_idx == 0 else "right"
