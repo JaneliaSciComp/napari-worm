@@ -19,8 +19,9 @@ import pandas as pd
 import tifffile
 from dask import delayed
 from qtpy.QtCore import QEvent, QObject, Qt, QTimer
+from qtpy.QtGui import QKeySequence
 from qtpy.QtWidgets import (
-    QHBoxLayout, QLabel, QSpinBox,
+    QHBoxLayout, QLabel, QShortcut, QSpinBox,
     QSplitter, QVBoxLayout, QWidget,
 )
 
@@ -139,10 +140,20 @@ def find_nucleus_centroid(data, seed, radius=7, threshold_fraction=0.5):
 # Annotation I/O
 # ---------------------------------------------------------------------------
 
-def save_annotations(points, filepath):
+def save_annotations(points, filepath, names=None):
+    """Save annotations in MIPAV format: name,x_voxels,y_voxels,z_voxels,R,G,B"""
     filepath = Path(filepath)
-    pd.DataFrame(points, columns=['z','y','x']).to_csv(filepath, index=False)
-    print(f"Saved {len(points)} annotations to {filepath}")
+    n = len(points)
+    if names is None:
+        names = [f"pt_{i}" for i in range(n)]
+    df = pd.DataFrame({
+        'name':     names,
+        'x_voxels': points[:, 2],
+        'y_voxels': points[:, 1],
+        'z_voxels': points[:, 0],
+        'R': 255, 'G': 255, 'B': 255,
+    })
+    df.to_csv(filepath, index=False)
 
 
 def load_annotations(filepath):
@@ -399,14 +410,20 @@ class WormAnnotator:
         # Build the single main window (MIPAV's JFrame equivalent)
         self.dual_window = DualViewWindow(self.viewer_left, self.viewer_right, nav_widget)
 
-        # Key bindings on both viewers so shortcuts work regardless of active canvas
-        for v in [self.viewer_left, self.viewer_right]:
-            v.bind_key('Right',     self._grid_next)
-            v.bind_key(']',         self._grid_next)
-            v.bind_key('Left',      self._grid_prev)
-            v.bind_key('[',         self._grid_prev)
-            v.bind_key('Control-z', self._undo_last_point)
-            v.bind_key('s',         self._save_annotations)
+        # Qt-level shortcuts on the host window so they fire regardless of which
+        # child widget has keyboard focus (napari bind_key only fires when the
+        # vispy canvas is focused, which it loses after layer-list interactions).
+        host = self.dual_window._host
+        def _sc(key, fn):
+            s = QShortcut(QKeySequence(key), host)
+            s.activated.connect(fn)
+        _sc('S',       lambda: self._save_annotations(self.viewer_left))
+        _sc('Ctrl+S',  lambda: self._save_annotations(self.viewer_left))
+        _sc('Ctrl+Z',  lambda: self._undo_last_point(self.viewer_left))
+        _sc('Right',   lambda: self._grid_next(self.viewer_left))
+        _sc(']',       lambda: self._grid_next(self.viewer_left))
+        _sc('Left',    lambda: self._grid_prev(self.viewer_left))
+        _sc('[',       lambda: self._grid_prev(self.viewer_left))
 
         # Show window FIRST so Qt initialises the GL context for both canvases,
         # then load layers.  If layers are added before the GL context exists,
@@ -576,7 +593,7 @@ class WormAnnotator:
                            / "integrated_annotation")
                 ann_dir.mkdir(parents=True, exist_ok=True)
                 save_path = ann_dir / "annotations_test.csv"
-                pd.DataFrame(pts, columns=['z','y','x']).to_csv(save_path, index=False)
+                save_annotations(pts, save_path)
                 total += len(pts)
                 print(f"  Saved {len(pts)} to {save_path}")
             print(f"Total: {total} annotations across {len(self.grid_annotations)} timepoints")
