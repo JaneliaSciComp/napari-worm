@@ -145,7 +145,7 @@ def save_annotations(points, filepath, names=None):
     filepath = Path(filepath)
     n = len(points)
     if names is None:
-        names = [f"pt_{i}" for i in range(n)]
+        names = [f"A{i}" for i in range(n)]
     df = pd.DataFrame({
         'name':     names,
         'x_voxels': points[:, 2],
@@ -154,6 +154,11 @@ def save_annotations(points, filepath, names=None):
         'R': 255, 'G': 255, 'B': 255,
     })
     df.to_csv(filepath, index=False)
+
+
+def _lattice_pair_name(pair_idx: int) -> str:
+    """Return name prefix for the i-th L/R lattice pair (matches MIPAV a0/a1/... convention)."""
+    return f"a{pair_idx}"
 
 
 def load_annotations(filepath):
@@ -189,7 +194,10 @@ class _CanvasClickFilter(QObject):
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.MouseButtonPress:
-            self._dual_window.set_active_side(self._side)
+            # Defer dock switch to next event-loop iteration so it doesn't
+            # run inside the GL canvas's own mouse-press handler (which causes
+            # a freeze on macOS when the dock resize triggers a GL repaint).
+            QTimer.singleShot(0, lambda: self._dual_window.set_active_side(self._side))
         return False  # pass event through
 
 
@@ -218,6 +226,7 @@ class DualViewWindow:
     def __init__(self, viewer_left, viewer_right, nav_widget):
         self._qt_left  = viewer_left.window._qt_viewer
         self._qt_right = viewer_right.window._qt_viewer
+        self._active_side = 0  # track current side to avoid redundant show/hide
         # Reuse viewer_left's native napari window — correct stylesheet, menubar,
         # status bar, console button, and dock area all work out of the box.
         self._host = viewer_left.window._qt_window
@@ -238,14 +247,16 @@ class DualViewWindow:
         vbox.addWidget(nav_widget, stretch=0)
         self._host.setCentralWidget(central)
 
-        # Move right viewer's docks into the host window; start hidden.
-        # Left viewer's docks are already registered with _host.
-        self._host.addDockWidget(Qt.LeftDockWidgetArea,
-                                 self._qt_right.dockLayerControls)
-        self._host.addDockWidget(Qt.LeftDockWidgetArea,
-                                 self._qt_right.dockLayerList)
-        self._qt_right.dockLayerControls.hide()
-        self._qt_right.dockLayerList.hide()
+        # Tabify right viewer's docks behind left viewer's docks.
+        # raise_() to switch tabs is purely cosmetic — no layout recalculation,
+        # no GL resize, no freeze (unlike setVisible which forces a full relayout).
+        self._host.tabifyDockWidget(self._qt_left.dockLayerControls,
+                                    self._qt_right.dockLayerControls)
+        self._host.tabifyDockWidget(self._qt_left.dockLayerList,
+                                    self._qt_right.dockLayerList)
+        # Start with left viewer's tabs on top
+        self._qt_left.dockLayerControls.raise_()
+        self._qt_left.dockLayerList.raise_()
 
         # Canvas click → switch active dock panel (MIPAV's setActiveRenderer)
         self._filter_left  = _CanvasClickFilter(self, 0)
@@ -257,7 +268,15 @@ class DualViewWindow:
         self._refresh_timer = QTimer(self._host)
         self._refresh_timer.timeout.connect(self._qt_left.canvas.native.update)
         self._refresh_timer.timeout.connect(self._qt_right.canvas.native.update)
-        self._refresh_timer.start(33)  # ~30 fps
+        self._refresh_timer.start(100)  # 10 fps — enough for smooth property updates
+
+        # Mirror viewer_right's status text into the host window's status bar
+        # so the cursor position/value is always visible regardless of active canvas.
+        if hasattr(viewer_right, 'status'):
+            viewer_right.events.status.connect(
+                lambda e: self._host.statusBar().showMessage(e.value)
+                if self._active_side == 1 else None
+            )
 
     # Proxy methods so call-sites in _init_dual_window_mode stay unchanged
     def showMaximized(self):
@@ -270,11 +289,16 @@ class DualViewWindow:
         self._host.resizeDocks(docks, sizes, orientation)
 
     def set_active_side(self, side: int):
-        """Show one viewer's dock panels and hide the other's."""
-        self._qt_left.dockLayerControls.setVisible(side == 0)
-        self._qt_left.dockLayerList.setVisible(side == 0)
-        self._qt_right.dockLayerControls.setVisible(side == 1)
-        self._qt_right.dockLayerList.setVisible(side == 1)
+        """Bring the active viewer's dock tabs to the front."""
+        if side == self._active_side:
+            return
+        self._active_side = side
+        if side == 0:
+            self._qt_left.dockLayerControls.raise_()
+            self._qt_left.dockLayerList.raise_()
+        else:
+            self._qt_right.dockLayerControls.raise_()
+            self._qt_right.dockLayerList.raise_()
 
 
 # ---------------------------------------------------------------------------
@@ -311,11 +335,14 @@ class WormAnnotator:
             self.viewer.bind_key('s', self._save_annotations)
 
         print("\n--- napari_worm ---")
-        print("  Ctrl+Click : annotate at peak intensity")
-        print("  Right / ]  : next timepoint pair")
-        print("  Left  / [  : previous timepoint pair")
-        print("  Ctrl+Z     : undo last annotation")
-        print("  S          : save annotations")
+        print("  Cmd+Click         : annotate at peak intensity")
+        print("  L                 : toggle lattice mode")
+        print("  (lattice mode)    Cmd+Click       = place Left  lattice point")
+        print("  (lattice mode)    Cmd+Shift+Click = place Right lattice point")
+        print("  Right / ]         : next timepoint pair")
+        print("  Left  / [         : previous timepoint pair")
+        print("  Cmd+Z             : undo last annotation/lattice point")
+        print("  S                 : save annotations + lattice")
         print("-------------------\n")
 
     # ------------------------------------------------------------------ #
@@ -395,6 +422,15 @@ class WormAnnotator:
         self.grid_points_layers: list = [None, None]
         self.grid_timepoints: list[int] = [start, min(start + 1, max_t)]
 
+        # Lattice state
+        self.lattice_mode = False
+        self.lattice_annotations: dict[int, dict] = {}  # {t: {'left': arr, 'right': arr}}
+        self.lattice_left_layers:  list = [None, None]
+        self.lattice_right_layers: list = [None, None]
+        self.lattice_line_layers:  list = [None, None]
+        self.lattice_mid_layers:   list = [None, None]
+        self.lattice_undo_stack: list = []  # ('L'|'R', timepoint, layer)
+
         first_vol = load_volume(self.tiff_files[start])
         self.contrast_limits = [float(first_vol.min()), float(first_vol.max())]
 
@@ -424,6 +460,7 @@ class WormAnnotator:
         _sc(']',       lambda: self._grid_next(self.viewer_left))
         _sc('Left',    lambda: self._grid_prev(self.viewer_left))
         _sc('[',       lambda: self._grid_prev(self.viewer_left))
+        _sc('L',       self._toggle_lattice_mode)
 
         # Show window FIRST so Qt initialises the GL context for both canvases,
         # then load layers.  If layers are added before the GL context exists,
@@ -472,6 +509,7 @@ class WormAnnotator:
     def _load_dual_pair(self, t_left: int, t_right: int):
         """Load two timepoints into their respective viewers."""
         self._save_grid_annotations_to_cache()
+        self._save_lattice_to_cache()
 
         self.viewer_left.layers.clear()
         self.viewer_right.layers.clear()
@@ -486,24 +524,65 @@ class WormAnnotator:
                 rendering='mip', contrast_limits=self.contrast_limits, multiscale=False)
             pts = viewer_ref.add_points(
                 ndim=3, name=f'Annotations t={ti}', size=5, face_color='yellow')
+            pts.mode = 'pan_zoom'  # prevent napari's native add-on-click
 
             if ti in self.grid_annotations and len(self.grid_annotations[ti]) > 0:
                 pts.data = self.grid_annotations[ti]
 
+            # Lattice layers: left (cyan squares), right (magenta squares), lines (yellow)
+            lat_l = viewer_ref.add_points(
+                ndim=3, name=f'Lattice Left t={ti}',  size=7,
+                face_color='cyan',    symbol='square')
+            lat_r = viewer_ref.add_points(
+                ndim=3, name=f'Lattice Right t={ti}', size=7,
+                face_color='magenta', symbol='square')
+            lat_lines = viewer_ref.add_shapes(
+                ndim=3, name=f'Lattice Lines t={ti}',
+                edge_color='yellow', edge_width=2, face_color='transparent')
+            lat_mid = viewer_ref.add_shapes(
+                ndim=3, name=f'Lattice Mid t={ti}',
+                edge_color='white', edge_width=3, face_color='transparent')
+            # Lock lattice layers to pan_zoom — our handler does all adding
+            for lyr in (lat_l, lat_r, lat_lines, lat_mid):
+                lyr.mode = 'pan_zoom'
+            # Lock pts too if already in lattice mode (e.g. after timepoint change)
+            if self.lattice_mode:
+                pts.mode = 'pan_zoom'
+
+            cached_lat = self.lattice_annotations.get(ti, {})
+            if len(cached_lat.get('left',  [])) > 0:
+                lat_l.data = cached_lat['left']
+            if len(cached_lat.get('right', [])) > 0:
+                lat_r.data = cached_lat['right']
+            self._update_lattice_visuals(lat_l, lat_r, lat_lines, lat_mid)
+
             # Each viewer handles only its own canvas — no click-routing needed
-            def make_handler(volume_data, side_idx, timepoint, img_ref, pts_ref):
+            def make_handler(volume_data, side_idx, timepoint,
+                             img_ref, pts_ref,
+                             lat_l_ref, lat_r_ref, lat_lines_ref, lat_mid_ref):
                 def handler(layer, event):
                     if 'Control' not in event.modifiers:
                         return
-                    self._on_click_dual(img_ref, event, volume_data, side_idx, timepoint, pts_ref)
+                    if self.lattice_mode:
+                        self._on_lattice_click(img_ref, event, volume_data,
+                                               side_idx, timepoint,
+                                               lat_l_ref, lat_r_ref,
+                                               lat_lines_ref, lat_mid_ref)
+                    else:
+                        self._on_click_dual(img_ref, event, volume_data,
+                                            side_idx, timepoint, pts_ref)
                 return handler
 
-            cb = make_handler(vol, side, ti, img, pts)
-            img.mouse_drag_callbacks.append(cb)
-            pts.mouse_drag_callbacks.append(cb)
+            cb = make_handler(vol, side, ti, img, pts, lat_l, lat_r, lat_lines, lat_mid)
+            for lyr in (img, pts, lat_l, lat_r):
+                lyr.mouse_drag_callbacks.append(cb)
 
-            self.grid_image_layers[side] = img
+            self.grid_image_layers[side]  = img
             self.grid_points_layers[side] = pts
+            self.lattice_left_layers[side]  = lat_l
+            self.lattice_right_layers[side] = lat_r
+            self.lattice_line_layers[side]  = lat_lines
+            self.lattice_mid_layers[side]   = lat_mid
 
         self._nav_updating = True
         self._left_spin.setValue(t_left)
@@ -521,6 +600,124 @@ class WormAnnotator:
                 ti = self.grid_timepoints[side]
                 if len(pts.data) > 0:
                     self.grid_annotations[ti] = pts.data.copy()
+
+    def _save_lattice_to_cache(self):
+        for side, (lat_l, lat_r) in enumerate(
+                zip(self.lattice_left_layers, self.lattice_right_layers)):
+            if lat_l is None or side >= len(self.grid_timepoints):
+                continue
+            ti = self.grid_timepoints[side]
+            entry = self.lattice_annotations.setdefault(ti, {})
+            if len(lat_l.data) > 0:
+                entry['left']  = lat_l.data.copy()
+            if lat_r is not None and len(lat_r.data) > 0:
+                entry['right'] = lat_r.data.copy()
+
+    def _toggle_lattice_mode(self):
+        self.lattice_mode = not self.lattice_mode
+        # pts layers are always pan_zoom — our handler does all point adding.
+        # No mode change needed here; the toggle is purely a routing flag.
+        if self.lattice_mode:
+            print("=" * 50)
+            print("  MODE: LATTICE")
+            print("  Cmd+Click       → Left  lattice point")
+            print("  Cmd+Shift+Click → Right lattice point")
+            print("  Cmd+Z           → undo last lattice point")
+            print("  L               → back to annotation mode")
+            print("=" * 50)
+        else:
+            print("=" * 50)
+            print("  MODE: ANNOTATION  (Cmd+Click = annotate)")
+            print("=" * 50)
+
+    def _on_lattice_click(self, img_layer, event, volume_data,
+                          side_idx, timepoint,
+                          lat_left_layer, lat_right_layer,
+                          lat_lines_layer, lat_mid_layer):
+        try:
+            near, far = img_layer.get_ray_intersections(
+                event.position, event.view_direction, event.dims_displayed)
+            if near is None or far is None:
+                print("[lattice] ray missed volume — click closer to the worm")
+                return
+            pos = find_nucleus_centroid(volume_data, find_peak_along_ray(volume_data, near, far))
+            canvas_label = "left" if side_idx == 0 else "right"
+
+            if 'Shift' in event.modifiers:
+                lat_right_layer.add(pos)
+                pair_idx = len(lat_right_layer.data) - 1
+                name = _lattice_pair_name(pair_idx) + 'R'
+                print(f"[t={timepoint} {canvas_label}] Lattice {name}  "
+                      f"z={pos[0]:.1f} y={pos[1]:.1f} x={pos[2]:.1f}")
+                self.lattice_undo_stack.append(('R', timepoint, lat_right_layer))
+            else:
+                lat_left_layer.add(pos)
+                pair_idx = len(lat_left_layer.data) - 1
+                name = _lattice_pair_name(pair_idx) + 'L'
+                print(f"[t={timepoint} {canvas_label}] Lattice {name}  "
+                      f"z={pos[0]:.1f} y={pos[1]:.1f} x={pos[2]:.1f}")
+                self.lattice_undo_stack.append(('L', timepoint, lat_left_layer))
+
+            self._update_lattice_visuals(lat_left_layer, lat_right_layer,
+                                         lat_lines_layer, lat_mid_layer)
+            entry = self.lattice_annotations.setdefault(timepoint, {})
+            entry['left']  = lat_left_layer.data.copy()  if len(lat_left_layer.data)  > 0 else np.empty((0, 3))
+            entry['right'] = lat_right_layer.data.copy() if len(lat_right_layer.data) > 0 else np.empty((0, 3))
+        except Exception as exc:
+            print(f"[lattice] click error: {exc}")
+
+    def _update_lattice_visuals(self, lat_l, lat_r, lat_lines, lat_mid):
+        n = min(len(lat_l.data), len(lat_r.data))
+
+        # --- L/R connecting lines (yellow) ---
+        if len(lat_lines.data) > 0:
+            lat_lines.selected_data = set(range(len(lat_lines.data)))
+            lat_lines.remove_selected()
+        for i in range(n):
+            lat_lines.add(
+                np.array([lat_l.data[i], lat_r.data[i]]),
+                shape_type='line',
+            )
+
+        # --- Midline / centerline (white path through midpoints) ---
+        if len(lat_mid.data) > 0:
+            lat_mid.selected_data = set(range(len(lat_mid.data)))
+            lat_mid.remove_selected()
+        if n >= 2:
+            mids = np.array([(lat_l.data[i] + lat_r.data[i]) / 2 for i in range(n)])
+            lat_mid.add(mids, shape_type='path')
+
+    def _save_lattice(self):
+        self._save_lattice_to_cache()
+        saved = 0
+        for ti, entry in sorted(self.lattice_annotations.items()):
+            left  = entry.get('left',  np.empty((0, 3)))
+            right = entry.get('right', np.empty((0, 3)))
+            if len(left) == 0 and len(right) == 0:
+                continue
+            # Interleave L/R pairs: a0L, a0R, a1L, a1R, ... (matches MIPAV order)
+            n_pairs = min(len(left), len(right))
+            rows = []
+            for i in range(n_pairs):
+                for pt, side in ((left[i], 'L'), (right[i], 'R')):
+                    rows.append({'name': _lattice_pair_name(i) + side,
+                                 'x_voxels': pt[2], 'y_voxels': pt[1], 'z_voxels': pt[0],
+                                 'R': 255, 'G': 255, 'B': 255})
+            # Append any unpaired trailing L points
+            for i in range(n_pairs, len(left)):
+                pt = left[i]
+                rows.append({'name': _lattice_pair_name(i) + 'L',
+                             'x_voxels': pt[2], 'y_voxels': pt[1], 'z_voxels': pt[0],
+                             'R': 255, 'G': 255, 'B': 255})
+            stem = self.tiff_files[ti].stem
+            lat_dir = self.volume_path / stem / f"{stem}_results" / "lattice_final"
+            lat_dir.mkdir(parents=True, exist_ok=True)
+            save_path = lat_dir / "lattice_test.csv"
+            pd.DataFrame(rows).to_csv(save_path, index=False)
+            print(f"  Lattice t={ti}: {len(left)}L + {len(right)}R → {save_path}")
+            saved += 1
+        if saved:
+            print(f"Lattice saved for {saved} timepoint(s)")
 
     def _on_spinbox_changed(self, _):
         if self._nav_updating:
@@ -553,6 +750,9 @@ class WormAnnotator:
         print(f"[t={timepoint} {label}] Added at z={pos[0]:.1f} y={pos[1]:.1f} x={pos[2]:.1f}")
 
     def _undo_last_point(self, viewer):
+        if self.lattice_mode:
+            self._undo_last_lattice_point()
+            return
         if not self.undo_stack:
             print("Nothing to undo")
             return
@@ -573,6 +773,25 @@ class WormAnnotator:
             print(f"[t={timepoint}] Undid last annotation (cached)")
         else:
             print(f"[t={timepoint}] Nothing to undo")
+
+    def _undo_last_lattice_point(self):
+        if not self.lattice_undo_stack:
+            print("[lattice] Nothing to undo")
+            return
+        side_char, timepoint, layer = self.lattice_undo_stack.pop()
+        if len(layer.data) > 0:
+            layer.data = layer.data[:-1]
+            for ll, lr, llines, lmid in zip(
+                    self.lattice_left_layers,
+                    self.lattice_right_layers,
+                    self.lattice_line_layers,
+                    self.lattice_mid_layers):
+                if ll is layer or lr is layer:
+                    self._update_lattice_visuals(ll, lr, llines, lmid)
+                    break
+            print(f"[t={timepoint}] Undid last lattice {side_char} point")
+        else:
+            print(f"[t={timepoint}] Nothing to undo in lattice")
 
     # ------------------------------------------------------------------ #
     # Save / Run                                                           #
@@ -597,6 +816,7 @@ class WormAnnotator:
                 total += len(pts)
                 print(f"  Saved {len(pts)} to {save_path}")
             print(f"Total: {total} annotations across {len(self.grid_annotations)} timepoints")
+            self._save_lattice()
         else:
             if not hasattr(self, 'points_layer') or len(self.points_layer.data) == 0:
                 print("No annotations to save")
