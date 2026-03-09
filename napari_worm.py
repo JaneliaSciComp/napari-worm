@@ -199,22 +199,33 @@ def _renumber_lattice_pairs(pair_infos: list[dict]) -> list[dict]:
     return pair_infos
 
 
-def _find_closest_lattice_point(pos: np.ndarray, left_pts: np.ndarray,
-                                right_pts: np.ndarray, threshold: float = 15.0):
-    """Find the closest existing lattice point to pos.
+def _point_to_ray_distance(point, ray_start, ray_end):
+    """Minimum distance from a 3D point to a line segment (ray_start→ray_end)."""
+    d = ray_end - ray_start
+    length_sq = np.dot(d, d)
+    if length_sq < 1e-12:
+        return np.linalg.norm(point - ray_start)
+    t = np.clip(np.dot(point - ray_start, d) / length_sq, 0, 1)
+    projection = ray_start + t * d
+    return np.linalg.norm(point - projection)
 
-    Returns (side, index, distance) where side is 'L' or 'R', or None if none within threshold.
-    Matches MIPAV's selectLattice() proximity check (12-unit threshold in MIPAV).
+
+def _find_closest_lattice_point_by_ray(near, far, left_pts, right_pts,
+                                        threshold=12.0):
+    """Find the closest existing lattice point to the camera ray.
+
+    Uses ray-to-point distance so it works regardless of where the peak/centroid
+    lands. If you click visually "on" a point, the ray passes near it.
+    Returns (side, index, distance) or None.
     """
     best = None
     for side_char, pts in [('L', left_pts), ('R', right_pts)]:
         if len(pts) == 0:
             continue
-        dists = np.linalg.norm(pts - pos, axis=1)
-        min_idx = int(np.argmin(dists))
-        min_dist = dists[min_idx]
-        if min_dist <= threshold and (best is None or min_dist < best[2]):
-            best = (side_char, min_idx, min_dist)
+        for i, pt in enumerate(pts):
+            dist = _point_to_ray_distance(pt, near, far)
+            if dist <= threshold and (best is None or dist < best[2]):
+                best = (side_char, i, dist)
     return best
 
 
@@ -252,7 +263,7 @@ def _segment_to_segment_distance(a0, a1, b0, b1):
 
 def _find_insertion_index(near: np.ndarray, far: np.ndarray,
                           left_pts: np.ndarray, right_pts: np.ndarray,
-                          threshold: float = 40.0) -> tuple[int, str] | None:
+                          threshold: float = 12.0) -> tuple[int, str] | None:
     """Find where to insert a new point between existing pairs.
 
     Matches MIPAV's addInsertionPoint(): measures the 3D distance from the
@@ -821,12 +832,15 @@ class WormAnnotator:
                     n_complete = min(n_l, n_r)
 
                     # --- Check for nearby existing point (select / drag) ---
+                    # Use ray-to-point distance: if the camera ray passes within
+                    # 12 voxels of any lattice point, select it. This works for
+                    # interpolated points in empty space (centroid shift doesn't matter).
                     drag_target = None
                     if n_l > 0 or n_r > 0:
-                        closest = _find_closest_lattice_point(
-                            pos,
-                            np.asarray(lat_l_ref.data) if n_l > 0 else np.empty((0, 3)),
-                            np.asarray(lat_r_ref.data) if n_r > 0 else np.empty((0, 3)))
+                        l_data = np.asarray(lat_l_ref.data) if n_l > 0 else np.empty((0, 3))
+                        r_data = np.asarray(lat_r_ref.data) if n_r > 0 else np.empty((0, 3))
+                        closest = _find_closest_lattice_point_by_ray(
+                            near, far, l_data, r_data, threshold=12.0)
                         if closest is not None:
                             drag_target = closest  # (side_char, pt_idx, dist)
 
