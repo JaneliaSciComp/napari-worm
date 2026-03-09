@@ -218,51 +218,75 @@ def _find_closest_lattice_point(pos: np.ndarray, left_pts: np.ndarray,
     return best
 
 
-def _find_insertion_index(pos: np.ndarray, left_pts: np.ndarray,
-                          right_pts: np.ndarray, threshold: float = 30.0) -> int | None:
+def _segment_to_segment_distance(a0, a1, b0, b1):
+    """Minimum distance between two 3D line segments a0→a1 and b0→b1.
+
+    Matches MIPAV's DistanceSegment3Segment3.Get() used in addInsertionPoint().
+    """
+    d1 = a1 - a0  # direction of segment A
+    d2 = b1 - b0  # direction of segment B
+    r = a0 - b0
+    a = np.dot(d1, d1)
+    e = np.dot(d2, d2)
+    f = np.dot(d2, r)
+    if a < 1e-12 and e < 1e-12:
+        return np.linalg.norm(r)
+    if a < 1e-12:
+        s, t = 0.0, np.clip(f / e, 0, 1)
+    else:
+        c = np.dot(d1, r)
+        if e < 1e-12:
+            t, s = 0.0, np.clip(-c / a, 0, 1)
+        else:
+            b_val = np.dot(d1, d2)
+            denom = a * e - b_val * b_val
+            s = np.clip((b_val * f - c * e) / denom, 0, 1) if abs(denom) > 1e-12 else 0.0
+            t = (b_val * s + f) / e
+            if t < 0:
+                t, s = 0.0, np.clip(-c / a, 0, 1)
+            elif t > 1:
+                t, s = 1.0, np.clip((b_val - c) / a, 0, 1)
+    closest = r + s * d1 - t * d2
+    return np.linalg.norm(closest)
+
+
+def _find_insertion_index(near: np.ndarray, far: np.ndarray,
+                          left_pts: np.ndarray, right_pts: np.ndarray,
+                          threshold: float = 12.0) -> int | None:
     """Find where to insert a new point between existing pairs.
 
-    Matches MIPAV's addInsertionPoint() segment proximity check.
-    Computes midpoints (centerline) from L/R pairs, then finds the closest
-    segment. Returns the index to insert AFTER, or None if too far from
-    any segment (meaning: append at end instead).
+    Matches MIPAV's addInsertionPoint(): measures the 3D distance from the
+    mouse RAY (near→far) to each left-curve segment and each right-curve
+    segment, then picks the closest segment within the threshold.
 
     Parameters
     ----------
-    pos : 3D position of the new point.
+    near, far : start/end of the camera ray through the volume.
     left_pts, right_pts : existing L/R point arrays.
-    threshold : max distance from centerline segment to trigger insertion.
+    threshold : max distance from ray to a segment (MIPAV uses 12 voxels).
 
     Returns
     -------
-    Index i such that the new point should be inserted between pair i and i+1,
-    or None if the point should be appended.
+    Index i such that the new point should be inserted at position i+1,
+    or None if no segment is close enough (append instead).
     """
     n = min(len(left_pts), len(right_pts))
     if n < 2:
         return None
 
-    mids = (left_pts[:n] + right_pts[:n]) / 2.0
-
     min_dist = float('inf')
     min_idx = None
 
-    for i in range(n - 1):
-        # Distance from pos to segment mids[i]→mids[i+1]
-        seg = mids[i + 1] - mids[i]
-        seg_len_sq = np.dot(seg, seg)
-        if seg_len_sq < 1e-12:
-            continue
-        t = np.clip(np.dot(pos - mids[i], seg) / seg_len_sq, 0, 1)
-        closest = mids[i] + t * seg
-        dist = np.linalg.norm(pos - closest)
-        if dist < min_dist:
-            min_dist = dist
-            min_idx = i
+    # Check both L and R curve segments (like MIPAV checks both)
+    for pts in (left_pts[:n], right_pts[:n]):
+        for i in range(n - 1):
+            dist = _segment_to_segment_distance(near, far, pts[i], pts[i + 1])
+            if dist < min_dist:
+                min_dist = dist
+                if dist <= threshold:
+                    min_idx = i
 
-    if min_dist <= threshold:
-        return min_idx
-    return None
+    return min_idx
 
 
 def _smooth_midline_spline(midpoints: np.ndarray, samples_per_segment: int = 20) -> np.ndarray:
@@ -649,8 +673,16 @@ class WormAnnotator:
         # In lattice mode with a selected point → nudge; otherwise → navigate.
         # Matches MIPAV: arrow keys move selected point when hasSelectedPoint() is true,
         # otherwise navigate the camera.
+        # Install arrow key filter on ALL widgets that might receive key events:
+        # the host window AND both canvas native widgets (vispy consumes keys directly)
         self._arrow_filter = _ArrowKeyFilter(self, host)
         host.installEventFilter(self._arrow_filter)
+        qt_left = self.dual_window._qt_left
+        qt_right = self.dual_window._qt_right
+        self._arrow_filter_l = _ArrowKeyFilter(self, qt_left.canvas.native)
+        self._arrow_filter_r = _ArrowKeyFilter(self, qt_right.canvas.native)
+        qt_left.canvas.native.installEventFilter(self._arrow_filter_l)
+        qt_right.canvas.native.installEventFilter(self._arrow_filter_r)
 
         # Show window FIRST so Qt initialises the GL context for both canvases,
         # then load layers.  If layers are added before the GL context exists,
@@ -924,11 +956,13 @@ class WormAnnotator:
             pair_names = self.lattice_pair_names.setdefault(timepoint, [])
 
             # --- Check for INSERTION between existing pairs ---
+            # Uses ray-to-segment distance (matches MIPAV addInsertionPoint)
             # Only when starting a new pair (next_side == 'L') and ≥2 complete pairs exist
             insert_idx = None
             if self.lattice_next_side == 'L' and n_complete >= 2:
                 insert_idx = _find_insertion_index(
-                    pos, np.asarray(lat_left_layer.data),
+                    near, far,
+                    np.asarray(lat_left_layer.data),
                     np.asarray(lat_right_layer.data))
 
             if insert_idx is not None:
