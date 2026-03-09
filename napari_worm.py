@@ -200,7 +200,7 @@ def _renumber_lattice_pairs(pair_infos: list[dict]) -> list[dict]:
 
 
 def _find_closest_lattice_point(pos: np.ndarray, left_pts: np.ndarray,
-                                right_pts: np.ndarray, threshold: float = 8.0):
+                                right_pts: np.ndarray, threshold: float = 15.0):
     """Find the closest existing lattice point to pos.
 
     Returns (side, index, distance) where side is 'L' or 'R', or None if none within threshold.
@@ -252,41 +252,51 @@ def _segment_to_segment_distance(a0, a1, b0, b1):
 
 def _find_insertion_index(near: np.ndarray, far: np.ndarray,
                           left_pts: np.ndarray, right_pts: np.ndarray,
-                          threshold: float = 12.0) -> int | None:
+                          threshold: float = 40.0) -> tuple[int, str] | None:
     """Find where to insert a new point between existing pairs.
 
     Matches MIPAV's addInsertionPoint(): measures the 3D distance from the
     mouse RAY (near→far) to each left-curve segment and each right-curve
     segment, then picks the closest segment within the threshold.
 
-    Parameters
-    ----------
-    near, far : start/end of the camera ray through the volume.
-    left_pts, right_pts : existing L/R point arrays.
-    threshold : max distance from ray to a segment (MIPAV uses 12 voxels).
-
     Returns
     -------
-    Index i such that the new point should be inserted at position i+1,
-    or None if no segment is close enough (append instead).
+    (index, side) where index i means insert at position i+1, and side is
+    'L' or 'R' indicating which curve was clicked (closer to ray).
+    The clicked side gets the actual click position; the other side is
+    interpolated from neighbors. Returns None if no segment is close enough.
     """
     n = min(len(left_pts), len(right_pts))
     if n < 2:
         return None
 
-    min_dist = float('inf')
-    min_idx = None
+    best_dist_l = float('inf')
+    best_idx_l = -1
+    for i in range(n - 1):
+        dist = _segment_to_segment_distance(near, far, left_pts[i], left_pts[i + 1])
+        if dist < best_dist_l and dist <= threshold:
+            best_dist_l = dist
+            best_idx_l = i
 
-    # Check both L and R curve segments (like MIPAV checks both)
-    for pts in (left_pts[:n], right_pts[:n]):
-        for i in range(n - 1):
-            dist = _segment_to_segment_distance(near, far, pts[i], pts[i + 1])
-            if dist < min_dist:
-                min_dist = dist
-                if dist <= threshold:
-                    min_idx = i
+    best_dist_r = float('inf')
+    best_idx_r = -1
+    for i in range(n - 1):
+        dist = _segment_to_segment_distance(near, far, right_pts[i], right_pts[i + 1])
+        if dist < best_dist_r and dist <= threshold:
+            best_dist_r = dist
+            best_idx_r = i
 
-    return min_idx
+    # Match MIPAV: if both sides have a hit, pick the closer one
+    if best_idx_l != -1 and best_idx_r != -1:
+        if best_dist_l <= best_dist_r:
+            return (best_idx_l, 'L')
+        else:
+            return (best_idx_r, 'R')
+    elif best_idx_l != -1:
+        return (best_idx_l, 'L')
+    elif best_idx_r != -1:
+        return (best_idx_r, 'R')
+    return None
 
 
 def _smooth_midline_spline(midpoints: np.ndarray, samples_per_segment: int = 20) -> np.ndarray:
@@ -799,7 +809,6 @@ class WormAnnotator:
                                             side_idx, timepoint, pts_ref)
                         return
 
-                    # --- Lattice mode: check if dragging an existing point ---
                     near, far = img_ref.get_ray_intersections(
                         event.position, event.view_direction, event.dims_displayed)
                     if near is None or far is None:
@@ -809,6 +818,9 @@ class WormAnnotator:
 
                     n_l = len(lat_l_ref.data)
                     n_r = len(lat_r_ref.data)
+                    n_complete = min(n_l, n_r)
+
+                    # --- Check for nearby existing point (select / drag) ---
                     drag_target = None
                     if n_l > 0 or n_r > 0:
                         closest = _find_closest_lattice_point(
@@ -818,8 +830,34 @@ class WormAnnotator:
                         if closest is not None:
                             drag_target = closest  # (side_char, pt_idx, dist)
 
-                    if drag_target is None:
-                        # No nearby point — add new point (click, not drag)
+                    if drag_target is not None:
+                        pass  # fall through to drag/select below
+                    elif n_complete >= 2:
+                        # --- Check for INSERTION (click on curve, MIPAV addInsertionPoint) ---
+                        result = _find_insertion_index(
+                            near, far,
+                            np.asarray(lat_l_ref.data),
+                            np.asarray(lat_r_ref.data))
+                        if result is not None:
+                            insert_idx, clicked_side = result
+                            is_seam = 'Shift' in event.modifiers
+                            self._do_lattice_insert(
+                                insert_idx, clicked_side, pos, is_seam,
+                                side_idx, timepoint,
+                                lat_l_ref, lat_r_ref,
+                                lat_lines_ref, lat_mid_ref,
+                                lat_lc_ref, lat_rc_ref)
+                            return
+                        else:
+                            # Not near any curve — append new point
+                            self._on_lattice_click(img_ref, event, volume_data,
+                                                   side_idx, timepoint,
+                                                   lat_l_ref, lat_r_ref,
+                                                   lat_lines_ref, lat_mid_ref,
+                                                   lat_lc_ref, lat_rc_ref)
+                            return
+                    else:
+                        # <2 complete pairs — just append
                         self._on_lattice_click(img_ref, event, volume_data,
                                                side_idx, timepoint,
                                                lat_l_ref, lat_r_ref,
@@ -827,7 +865,7 @@ class WormAnnotator:
                                                lat_lc_ref, lat_rc_ref)
                         return
 
-                    # --- Drag existing point (matches MIPAV modifyLattice) ---
+                    # --- Select / drag existing point (MIPAV modifyLattice) ---
                     side_char, pt_idx, dist = drag_target
                     drag_layer = lat_l_ref if side_char == 'L' else lat_r_ref
                     pair_names = self.lattice_pair_names.get(timepoint, [])
@@ -835,18 +873,18 @@ class WormAnnotator:
                     self.lattice_last_placed = {
                         'side_idx': side_idx, 'timepoint': timepoint,
                         'layer': drag_layer, 'char': side_char, 'index': pt_idx}
-                    print(f"[t={timepoint}] Dragging {name}")
+                    print(f"[t={timepoint}] Selected {name} (drag to move, arrows to nudge)")
 
                     yield  # wait for mouse move events
 
+                    dragged = False
                     while event.type == 'mouse_move':
                         if 'Control' not in event.modifiers:
                             break
+                        dragged = True
                         near2, far2 = img_ref.get_ray_intersections(
                             event.position, event.view_direction, event.dims_displayed)
                         if near2 is not None and far2 is not None:
-                            # Use peak only during drag for responsiveness
-                            # (MIPAV's modifyLattice uses raw ray position)
                             new_pos = find_peak_along_ray(volume_data, near2, far2)
                             pts = drag_layer.data.copy()
                             pts[pt_idx] = new_pos
@@ -860,7 +898,8 @@ class WormAnnotator:
                     entry = self.lattice_annotations.setdefault(timepoint, {})
                     entry['left'] = lat_l_ref.data.copy() if len(lat_l_ref.data) > 0 else np.empty((0, 3))
                     entry['right'] = lat_r_ref.data.copy() if len(lat_r_ref.data) > 0 else np.empty((0, 3))
-                    print(f"[t={timepoint}] Released {name}")
+                    if dragged:
+                        print(f"[t={timepoint}] Released {name}")
 
                 return handler
 
@@ -918,9 +957,9 @@ class WormAnnotator:
             self.lattice_last_placed = None
             print("=" * 50)
             print("  MODE: LATTICE  (nose → tail, left → right)")
-            print("  Cmd+Click       → add lattice point (alternates L/R)")
-            print("  Cmd+Drag        → drag existing point (near point)")
-            print("  Cmd+Click       → insert pair (near existing segment)")
+            print("  Cmd+Click       → add point (alternates L/R)")
+            print("  Cmd+Click curve → insert pair (click on magenta/green curve)")
+            print("  Cmd+Click point → select point, then drag or arrow-nudge")
             print("  Cmd+Shift+Click → seam cell (also L/R pair)")
             print("  Arrow keys      → nudge selected point")
             print("  Cmd+Z           → undo (point, pair, or insertion)")
@@ -937,6 +976,7 @@ class WormAnnotator:
                           lat_left_layer, lat_right_layer,
                           lat_lines_layer, lat_mid_layer,
                           lat_left_curve_layer, lat_right_curve_layer):
+        """Append a new lattice point (L or R). Insertion is handled separately."""
         try:
             near, far = img_layer.get_ray_intersections(
                 event.position, event.view_direction, event.dims_displayed)
@@ -946,67 +986,15 @@ class WormAnnotator:
             pos = find_nucleus_centroid(volume_data, find_peak_along_ray(volume_data, near, far))
             canvas_label = "left" if side_idx == 0 else "right"
 
-            n_left = len(lat_left_layer.data)
-            n_right = len(lat_right_layer.data)
-
-            # Determine if this is a seam cell (Cmd+Shift) or regular lattice (Cmd)
             is_seam = 'Shift' in event.modifiers
             pair_type = 'seam' if is_seam else 'lattice'
-            n_complete = min(n_left, n_right)
             pair_names = self.lattice_pair_names.setdefault(timepoint, [])
 
-            # --- Check for INSERTION between existing pairs ---
-            # Uses ray-to-segment distance (matches MIPAV addInsertionPoint)
-            # Only when starting a new pair (next_side == 'L') and ≥2 complete pairs exist
-            insert_idx = None
-            if self.lattice_next_side == 'L' and n_complete >= 2:
-                insert_idx = _find_insertion_index(
-                    near, far,
-                    np.asarray(lat_left_layer.data),
-                    np.asarray(lat_right_layer.data))
-
-            if insert_idx is not None:
-                # --- INSERT both L and R (matching MIPAV addInsertionPoint) ---
-                idx = insert_idx + 1  # insert AFTER the matched segment
-                new_left = pos
-                # Interpolate R from neighbors (average of surrounding R points)
-                r_pts = np.asarray(lat_right_layer.data)
-                new_right = (r_pts[insert_idx] + r_pts[insert_idx + 1]) / 2.0
-
-                # Insert into layer data arrays
-                left_data = np.insert(np.asarray(lat_left_layer.data), idx, new_left, axis=0)
-                right_data = np.insert(np.asarray(lat_right_layer.data), idx, new_right, axis=0)
-                lat_left_layer.data = left_data
-                lat_right_layer.data = right_data
-
-                # Insert pair name metadata and renumber
-                pair_names.insert(idx, {'name': '', 'type': pair_type})
-                _renumber_lattice_pairs(pair_names)
-                # Rebuild seam counter from pair_names
-                self.lattice_seam_counter[timepoint] = [
-                    p['name'] for p in pair_names if p['type'] == 'seam']
-
-                inserted_name = pair_names[idx]['name']
-                print(f"[t={timepoint} {canvas_label}] INSERTED {inserted_name}L + {inserted_name}R "
-                      f"between pair {insert_idx} and {insert_idx + 1}")
-                # Print renumbered names
-                names_str = ', '.join(p['name'] for p in pair_names)
-                print(f"  Renumbered: {names_str}")
-
-                self.lattice_undo_stack.append(('INSERT', timepoint,
-                                                (lat_left_layer, lat_right_layer, idx)))
-                self.lattice_last_placed = {
-                    'side_idx': side_idx, 'timepoint': timepoint,
-                    'layer': lat_left_layer, 'char': 'L'}
-                # next_side stays 'L' since we inserted a complete pair
-
-            elif self.lattice_next_side == 'L':
-                # --- APPEND new L point (start of a new pair) ---
+            if self.lattice_next_side == 'L':
                 lat_left_layer.add(pos)
                 new_info = {'name': '', 'type': pair_type}
                 pair_names.append(new_info)
                 _renumber_lattice_pairs(pair_names)
-                # Rebuild seam counter
                 self.lattice_seam_counter[timepoint] = [
                     p['name'] for p in pair_names if p['type'] == 'seam']
 
@@ -1016,10 +1004,10 @@ class WormAnnotator:
                 self.lattice_undo_stack.append(('L', timepoint, lat_left_layer))
                 self.lattice_last_placed = {
                     'side_idx': side_idx, 'timepoint': timepoint,
-                    'layer': lat_left_layer, 'char': 'L'}
+                    'layer': lat_left_layer, 'char': 'L',
+                    'index': len(lat_left_layer.data) - 1}
                 self.lattice_next_side = 'R'
             else:
-                # --- APPEND R point (complete the current pair) ---
                 lat_right_layer.add(pos)
                 pair_idx = len(lat_right_layer.data) - 1
                 if pair_idx < len(pair_names):
@@ -1031,7 +1019,8 @@ class WormAnnotator:
                 self.lattice_undo_stack.append(('R', timepoint, lat_right_layer))
                 self.lattice_last_placed = {
                     'side_idx': side_idx, 'timepoint': timepoint,
-                    'layer': lat_right_layer, 'char': 'R'}
+                    'layer': lat_right_layer, 'char': 'R',
+                    'index': len(lat_right_layer.data) - 1}
                 self.lattice_next_side = 'L'
 
             self._update_lattice_visuals(lat_left_layer, lat_right_layer,
@@ -1044,6 +1033,66 @@ class WormAnnotator:
             import traceback
             traceback.print_exc()
             print(f"[lattice] click error: {exc}")
+
+    def _do_lattice_insert(self, seg_idx, clicked_side, pos, is_seam,
+                           side_idx, timepoint,
+                           lat_left_layer, lat_right_layer,
+                           lat_lines_layer, lat_mid_layer,
+                           lat_left_curve_layer, lat_right_curve_layer):
+        """Insert a new L+R pair between existing pairs (MIPAV addInsertionPoint).
+
+        The clicked side gets the actual click position; the other side is
+        interpolated as the midpoint of its neighbors.
+        """
+        try:
+            idx = seg_idx + 1  # insert AFTER the matched segment
+            pair_type = 'seam' if is_seam else 'lattice'
+            canvas_label = "left" if side_idx == 0 else "right"
+
+            l_pts = np.asarray(lat_left_layer.data)
+            r_pts = np.asarray(lat_right_layer.data)
+
+            if clicked_side == 'L':
+                new_left = pos
+                new_right = (r_pts[seg_idx] + r_pts[seg_idx + 1]) / 2.0
+            else:
+                new_right = pos
+                new_left = (l_pts[seg_idx] + l_pts[seg_idx + 1]) / 2.0
+
+            left_data = np.insert(l_pts, idx, new_left, axis=0)
+            right_data = np.insert(r_pts, idx, new_right, axis=0)
+            lat_left_layer.data = left_data
+            lat_right_layer.data = right_data
+
+            pair_names = self.lattice_pair_names.setdefault(timepoint, [])
+            pair_names.insert(idx, {'name': '', 'type': pair_type})
+            _renumber_lattice_pairs(pair_names)
+            self.lattice_seam_counter[timepoint] = [
+                p['name'] for p in pair_names if p['type'] == 'seam']
+
+            inserted_name = pair_names[idx]['name']
+            print(f"[t={timepoint} {canvas_label}] INSERTED {inserted_name}L + {inserted_name}R "
+                  f"at index {idx} (clicked {clicked_side} curve)")
+            names_str = ', '.join(p['name'] for p in pair_names)
+            print(f"  Renumbered: {names_str}")
+
+            self.lattice_undo_stack.append(('INSERT', timepoint,
+                                            (lat_left_layer, lat_right_layer, idx)))
+            clicked_layer = lat_left_layer if clicked_side == 'L' else lat_right_layer
+            self.lattice_last_placed = {
+                'side_idx': side_idx, 'timepoint': timepoint,
+                'layer': clicked_layer, 'char': clicked_side, 'index': idx}
+
+            self._update_lattice_visuals(lat_left_layer, lat_right_layer,
+                                         lat_lines_layer, lat_mid_layer,
+                                         lat_left_curve_layer, lat_right_curve_layer)
+            entry = self.lattice_annotations.setdefault(timepoint, {})
+            entry['left']  = lat_left_layer.data.copy()
+            entry['right'] = lat_right_layer.data.copy()
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            print(f"[lattice] insert error: {exc}")
 
     def _update_lattice_visuals(self, lat_l, lat_r, lat_lines, lat_mid,
                                lat_left_curve, lat_right_curve):
