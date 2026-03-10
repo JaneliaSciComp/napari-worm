@@ -1145,10 +1145,12 @@ class WormAnnotator:
             print("  D               → done with lattice")
             print("  L               → back to annotation mode")
             print("=" * 50)
+            show_info("LATTICE MODE")
         else:
             print("=" * 50)
             print("  MODE: ANNOTATION  (Cmd+Click = annotate)")
             print("=" * 50)
+            show_info("ANNOTATION MODE")
 
     def _on_lattice_click(self, img_layer, event, volume_data,
                           side_idx, timepoint,
@@ -1180,6 +1182,8 @@ class WormAnnotator:
                 name = pair_names[-1]['name'] + 'L'
                 print(f"[t={timepoint} {canvas_label}] {name}  "
                       f"z={pos[0]:.1f} y={pos[1]:.1f} x={pos[2]:.1f}  (next: R)")
+                if is_seam:
+                    show_info(f"Seam cell: {pair_names[-1]['name']}L")
                 self.lattice_undo_stack.append(('L', timepoint, lat_left_layer))
                 self.lattice_last_placed = {
                     'side_idx': side_idx, 'timepoint': timepoint,
@@ -1195,6 +1199,8 @@ class WormAnnotator:
                     name = f'?{pair_idx}R'
                 print(f"[t={timepoint} {canvas_label}] {name}  "
                       f"z={pos[0]:.1f} y={pos[1]:.1f} x={pos[2]:.1f}  (next: L)")
+                if pair_idx < len(pair_names) and pair_names[pair_idx]['type'] == 'seam':
+                    show_info(f"Seam cell: {name}")
                 self.lattice_undo_stack.append(('R', timepoint, lat_right_layer))
                 self.lattice_last_placed = {
                     'side_idx': side_idx, 'timepoint': timepoint,
@@ -1250,10 +1256,13 @@ class WormAnnotator:
                 p['name'] for p in pair_names if p['type'] == 'seam']
 
             inserted_name = pair_names[idx]['name']
-            print(f"[t={timepoint} {canvas_label}] INSERTED {inserted_name}L + {inserted_name}R "
+            label = "Seam cell" if is_seam else "Inserted"
+            print(f"[t={timepoint} {canvas_label}] {label} {inserted_name}L + {inserted_name}R "
                   f"at index {idx} (clicked {clicked_side} curve)")
             names_str = ', '.join(p['name'] for p in pair_names)
             print(f"  Renumbered: {names_str}")
+            if is_seam:
+                show_info(f"Seam cell inserted: {inserted_name}")
 
             self.lattice_undo_stack.append(('INSERT', timepoint,
                                             (lat_left_layer, lat_right_layer, idx)))
@@ -1578,6 +1587,7 @@ class WormAnnotator:
                 wf.visible = self.wireframe_visible
         state = "ON" if self.wireframe_visible else "OFF"
         print(f"Wireframe: {state}")
+        show_info(f"Wireframe: {state}")
 
     def _on_lattice_done(self):
         """Finalize the lattice — save and exit lattice mode."""
