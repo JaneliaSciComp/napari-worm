@@ -14,6 +14,7 @@ from pathlib import Path
 
 import dask.array as da
 import napari
+from napari.utils.notifications import show_info
 import numpy as np
 import pandas as pd
 import tifffile
@@ -349,6 +350,161 @@ def _smooth_midline_spline(midpoints: np.ndarray, samples_per_segment: int = 20)
     return cs(t_fine)
 
 
+def _make_spline_with_derivative(points: np.ndarray):
+    """Create a natural cubic spline and return (spline, derivative_spline).
+
+    Returns a tuple (cs, cs_deriv) where cs(t) gives positions and
+    cs_deriv(t) gives tangent vectors, both in arc-length parametrization.
+    """
+    n = len(points)
+    if n < 2:
+        return None, None
+    dists = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    cumlen = np.concatenate([[0.0], np.cumsum(dists)])
+    total = cumlen[-1]
+    if total < 1e-12:
+        return None, None
+    t = cumlen / total
+    cs = CubicSpline(t, points, axis=0, bc_type='natural')
+    cs_deriv = cs.derivative()
+    return cs, cs_deriv
+
+
+def generate_wireframe_mesh(left_pts: np.ndarray, right_pts: np.ndarray,
+                            num_ellipse_pts: int = 32,
+                            num_samples: int = 0) -> list[np.ndarray]:
+    """Generate wireframe mesh from lattice L/R points (MIPAV generateCurves + generateEllipses).
+
+    Algorithm (matching LatticeModel.java):
+    1. Compute center spline as midpoint of L/R pairs
+    2. Sample center spline uniformly (1-voxel steps)
+    3. At each sample: build orthogonal frame (tangent, right, up)
+    4. Draw ellipse in the (right, up) plane
+    5. Fit num_ellipse_pts longitudinal splines through corresponding ellipse points
+    6. Return paths for wireframe rendering
+
+    Parameters
+    ----------
+    left_pts : (N, 3) array of left lattice points (z, y, x)
+    right_pts : (N, 3) array of right lattice points (z, y, x)
+    num_ellipse_pts : points per cross-section circle (MIPAV default: 32)
+    num_samples : number of uniformly-spaced cross-sections along center spline.
+                  0 = auto (1-voxel step size, matching MIPAV).
+
+    Returns
+    -------
+    List of (M, 3) arrays — each is a smooth longitudinal path for wireframe display.
+    Also includes cross-section rings.
+    """
+    n = min(len(left_pts), len(right_pts))
+    if n < 3:
+        return []
+
+    # --- Step 1: Center, left, right splines ---
+    centers = (left_pts[:n] + right_pts[:n]) / 2.0
+    center_cs, center_deriv = _make_spline_with_derivative(centers)
+    left_cs, _ = _make_spline_with_derivative(left_pts[:n])
+    right_cs, _ = _make_spline_with_derivative(right_pts[:n])
+    if center_cs is None or left_cs is None or right_cs is None:
+        return []
+
+    # --- Step 2: Uniform sampling along center spline (MIPAV: 1-voxel steps) ---
+    # Estimate total arc length
+    t_dense = np.linspace(0, 1, 500)
+    pts_dense = center_cs(t_dense)
+    arc_lengths = np.concatenate([[0], np.cumsum(
+        np.linalg.norm(np.diff(pts_dense, axis=0), axis=1))])
+    total_length = arc_lengths[-1]
+    if total_length < 1e-6:
+        return []
+
+    if num_samples <= 0:
+        num_samples = max(int(np.ceil(total_length)), 10)
+
+    # Find parameter values for uniformly-spaced arc-length positions
+    target_arcs = np.linspace(0, total_length, num_samples)
+    t_uniform = np.interp(target_arcs, arc_lengths, t_dense)
+
+    # --- Step 3 & 4: Build orthogonal frames and ellipses at each cross-section ---
+    angles = np.linspace(0, 2 * np.pi, num_ellipse_pts, endpoint=False)
+    cos_a = np.cos(angles)
+    sin_a = np.sin(angles)
+
+    # ellipse_rings[i] = (num_ellipse_pts, 3) — points around i-th cross-section
+    ellipse_rings = []
+
+    for t_val in t_uniform:
+        center = center_cs(t_val)
+        tangent = center_deriv(t_val)
+        tangent_norm = np.linalg.norm(tangent)
+        if tangent_norm < 1e-12:
+            tangent = np.array([1.0, 0.0, 0.0])
+        else:
+            tangent = tangent / tangent_norm
+
+        # Right vector: from left curve to right curve at this parameter
+        left_pt = left_cs(t_val)
+        right_pt = right_cs(t_val)
+        right_vec = right_pt - left_pt
+        right_norm = np.linalg.norm(right_vec)
+        if right_norm < 1e-12:
+            # Fallback: pick an arbitrary perpendicular
+            if abs(tangent[0]) < 0.9:
+                right_vec = np.cross(tangent, np.array([1, 0, 0]))
+            else:
+                right_vec = np.cross(tangent, np.array([0, 1, 0]))
+            right_norm = np.linalg.norm(right_vec)
+
+        right_vec = right_vec / right_norm
+
+        # Remove tangent component from right_vec (Gram-Schmidt) to ensure orthogonality
+        right_vec = right_vec - np.dot(right_vec, tangent) * tangent
+        rn = np.linalg.norm(right_vec)
+        if rn < 1e-12:
+            if abs(tangent[0]) < 0.9:
+                right_vec = np.cross(tangent, np.array([1, 0, 0]))
+            else:
+                right_vec = np.cross(tangent, np.array([0, 1, 0]))
+            right_vec = right_vec / np.linalg.norm(right_vec)
+        else:
+            right_vec = right_vec / rn
+
+        # Up vector: cross product (matches MIPAV: upDir = cross(normal, rightDir))
+        up_vec = np.cross(tangent, right_vec)
+        up_vec = up_vec / np.linalg.norm(up_vec)
+
+        # Worm diameter at this point (distance between L and R curves)
+        diameter = np.linalg.norm(right_pt - left_pt)
+        # Major radius = half L/R distance; minor ≈ half major (MIPAV ellipse)
+        r_major = diameter / 2.0
+        r_minor = r_major / 2.0
+
+        # Generate ellipse points in the (right_vec, up_vec) plane
+        ring = np.empty((num_ellipse_pts, 3))
+        for j in range(num_ellipse_pts):
+            ring[j] = center + r_major * cos_a[j] * right_vec + r_minor * sin_a[j] * up_vec
+        ellipse_rings.append(ring)
+
+    # --- Step 5: Fit longitudinal splines through corresponding ellipse points ---
+    paths = []
+
+    # Longitudinal curves (32 splines running nose-to-tail)
+    for j in range(num_ellipse_pts):
+        control_pts = np.array([ring[j] for ring in ellipse_rings])
+        spline_pts = _smooth_midline_spline(control_pts, samples_per_segment=5)
+        paths.append(spline_pts)
+
+    # Cross-section rings (every few samples for wireframe look)
+    ring_step = max(1, num_samples // 20)  # ~20 cross-section rings
+    for i in range(0, num_samples, ring_step):
+        ring = ellipse_rings[i]
+        # Close the ring by appending the first point
+        closed_ring = np.vstack([ring, ring[0:1]])
+        paths.append(closed_ring)
+
+    return paths
+
+
 def load_annotations(filepath):
     filepath = Path(filepath)
     if not filepath.exists():
@@ -563,6 +719,7 @@ class WormAnnotator:
         print("  Left  / [         : previous timepoint pair")
         print("  Cmd+Z             : undo last annotation/lattice point")
         print("  S                 : save annotations + lattice")
+        print("  W                 : toggle wireframe mesh")
         print("-------------------\n")
 
     # ------------------------------------------------------------------ #
@@ -651,6 +808,8 @@ class WormAnnotator:
         self.lattice_mid_layers:   list = [None, None]
         self.lattice_left_curve_layers:  list = [None, None]
         self.lattice_right_curve_layers: list = [None, None]
+        self.wireframe_layers: list = [None, None]
+        self.wireframe_visible: bool = False
         self.lattice_next_side: str = 'L'  # alternates L→R→L→R (nose to tail)
         self.lattice_last_placed: dict | None = None  # {'side_idx', 'timepoint', 'layer', 'char'}
         # Ordered list of pair metadata per timepoint:
@@ -689,6 +848,7 @@ class WormAnnotator:
         _sc('[',       lambda: self._grid_prev(self.viewer_left))
         _sc('L',       self._toggle_lattice_mode)
         _sc('D',       self._on_lattice_done)
+        _sc('W',       self._toggle_wireframe)
 
         # Event filter intercepts arrow keys BEFORE napari's canvas consumes them.
         # In lattice mode with a selected point → nudge; otherwise → navigate.
@@ -791,9 +951,13 @@ class WormAnnotator:
             lat_right_curve = viewer_ref.add_shapes(
                 ndim=3, name=f'Lattice Right Curve t={ti}',
                 edge_color='green', edge_width=1, face_color='transparent')
+            wireframe = viewer_ref.add_shapes(
+                ndim=3, name=f'Wireframe t={ti}',
+                edge_color='white', edge_width=0.5, face_color='transparent')
+            wireframe.visible = self.wireframe_visible
             # Lock lattice layers to pan_zoom — our handler does all adding
             for lyr in (lat_l, lat_r, lat_lines, lat_mid,
-                        lat_left_curve, lat_right_curve):
+                        lat_left_curve, lat_right_curve, wireframe):
                 lyr.mode = 'pan_zoom'
             # Lock pts too if already in lattice mode (e.g. after timepoint change)
             if self.lattice_mode:
@@ -921,7 +1085,7 @@ class WormAnnotator:
                               lat_left_curve, lat_right_curve)
             # Register on ALL layers so Cmd+Click works regardless of sidebar selection
             for lyr in (img, pts, lat_l, lat_r, lat_lines, lat_mid,
-                        lat_left_curve, lat_right_curve):
+                        lat_left_curve, lat_right_curve, wireframe):
                 lyr.mouse_drag_callbacks.append(cb)
 
             self.grid_image_layers[side]  = img
@@ -932,6 +1096,7 @@ class WormAnnotator:
             self.lattice_mid_layers[side]   = lat_mid
             self.lattice_left_curve_layers[side]  = lat_left_curve
             self.lattice_right_curve_layers[side] = lat_right_curve
+            self.wireframe_layers[side] = wireframe
 
         self._nav_updating = True
         self._left_spin.setValue(t_left)
@@ -1146,6 +1311,24 @@ class WormAnnotator:
             lat_right_curve.add(_smooth_midline_spline(np.asarray(lat_r.data)),
                                 shape_type='path')
 
+        # --- Wireframe mesh (32 longitudinal splines + cross-section rings) ---
+        # Only compute when wireframe is visible (W key) — expensive operation
+        if self.wireframe_visible:
+            wf_layer = None
+            for side, ll in enumerate(self.lattice_left_layers):
+                if ll is lat_l:
+                    wf_layer = self.wireframe_layers[side]
+                    break
+            if wf_layer is not None:
+                _clear_shapes(wf_layer)
+                if n >= 3:
+                    left_data = np.asarray(lat_l.data)
+                    right_data = np.asarray(lat_r.data)
+                    paths = generate_wireframe_mesh(left_data, right_data)
+                    for path in paths:
+                        if len(path) >= 2:
+                            wf_layer.add(path, shape_type='path')
+
     @staticmethod
     def _save_csv_retry(df, path, retries=3):
         """Save DataFrame to CSV with retry for network drives (BlockingIOError)."""
@@ -1164,6 +1347,7 @@ class WormAnnotator:
     def _save_lattice(self):
         self._save_lattice_to_cache()
         saved = 0
+        saved_paths = []
         for ti, entry in sorted(self.lattice_annotations.items()):
             left  = entry.get('left',  np.empty((0, 3)))
             right = entry.get('right', np.empty((0, 3)))
@@ -1199,9 +1383,12 @@ class WormAnnotator:
             save_path = lat_dir / "lattice_test.csv"
             self._save_csv_retry(pd.DataFrame(rows), save_path)
             print(f"  Lattice t={ti}: {len(rows)} points → {save_path}")
+            saved_paths.append(str(save_path))
             saved += 1
         if saved:
-            print(f"Lattice saved for {saved} timepoint(s)")
+            msg = f"Lattice saved for {saved} timepoint(s):\n" + "\n".join(saved_paths)
+            print(msg)
+            show_info(msg)
 
     def _on_spinbox_changed(self, _):
         if self._nav_updating:
@@ -1375,6 +1562,23 @@ class WormAnnotator:
                 entry['right'] = layer.data.copy()
                 break
 
+    def _toggle_wireframe(self):
+        """Toggle wireframe mesh visibility. Rebuilds mesh when turning on."""
+        self.wireframe_visible = not self.wireframe_visible
+        if self.wireframe_visible:
+            # Rebuild wireframe to catch up with current lattice state
+            for ll, lr, llines, lmid, llc, lrc in zip(
+                    self.lattice_left_layers, self.lattice_right_layers,
+                    self.lattice_line_layers, self.lattice_mid_layers,
+                    self.lattice_left_curve_layers, self.lattice_right_curve_layers):
+                if ll is not None and lr is not None:
+                    self._update_lattice_visuals(ll, lr, llines, lmid, llc, lrc)
+        for wf in self.wireframe_layers:
+            if wf is not None:
+                wf.visible = self.wireframe_visible
+        state = "ON" if self.wireframe_visible else "OFF"
+        print(f"Wireframe: {state}")
+
     def _on_lattice_done(self):
         """Finalize the lattice — save and exit lattice mode."""
         if not self.lattice_mode:
@@ -1395,8 +1599,10 @@ class WormAnnotator:
             self._save_grid_annotations_to_cache()
             if not self.grid_annotations:
                 print("No annotations to save")
+                show_info("No annotations to save")
                 return
             total = 0
+            ann_paths = []
             for ti, pts in sorted(self.grid_annotations.items()):
                 if len(pts) == 0:
                     continue
@@ -1407,16 +1613,21 @@ class WormAnnotator:
                 save_path = ann_dir / "annotations_test.csv"
                 save_annotations(pts, save_path)
                 total += len(pts)
+                ann_paths.append(str(save_path))
                 print(f"  Saved {len(pts)} to {save_path}")
-            print(f"Total: {total} annotations across {len(self.grid_annotations)} timepoints")
+            msg = f"Saved {total} annotations across {len(self.grid_annotations)} timepoint(s):\n" + "\n".join(ann_paths)
+            print(msg)
+            show_info(msg)
             self._save_lattice()
         else:
             if not hasattr(self, 'points_layer') or len(self.points_layer.data) == 0:
                 print("No annotations to save")
+                show_info("No annotations to save")
                 return
             save_path = (Path(self.annotations_path) if self.annotations_path
                          else self.volume_path.with_suffix('.csv'))
             save_annotations(self.points_layer.data, save_path)
+            show_info(f"Saved {len(self.points_layer.data)} annotations to {save_path}")
 
     def run(self):
         napari.run()

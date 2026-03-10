@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Pixi
+.pixi/
+
+# OS
+.DS_Store
+
+# Screenshots (local dev only)
+screesnhots/
+
+# Internal planning docs (not for repo)
+PROJECT_PLAN.md
+
+# Temp data
+*.csv
+!examples/*.csv
