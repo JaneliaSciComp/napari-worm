@@ -14,6 +14,7 @@ Developed at the **Shroff Lab**, Janelia Research Campus.
 - **Seam cells**: Cmd+Shift+Click to mark seam cells (H0, H1, H2, V1-V6, T) with automatic MIPAV-compatible naming
 - **Insert / drag / nudge**: Click on curves to insert pairs, drag points to reposition, arrow keys to nudge by 1 voxel
 - **Wireframe mesh**: 32 longitudinal splines around elliptical cross-sections (toggle with `W` key), matching MIPAV's `generateCurves()` / `generateEllipses()` algorithm
+- **Surface mesh**: Solid triangle mesh rendered with smooth Phong shading and turbo colormap (toggle with `Shift+W`), matching MIPAV's `generateTriMesh()` — head/tail caps + body quads
 - **MIPAV-compatible output**: Saves `annotations_test.csv` and `lattice_test.csv` per timepoint in the expected directory structure
 - **Toast notifications**: In-app notifications for save confirmations, mode changes, and seam cell placement
 
@@ -54,6 +55,7 @@ pixi run python napari_worm.py /path/to/RegB/ --no-grid
 | `Cmd+Shift+Click` | Place seam cell (lattice mode) |
 | `L` | Toggle lattice mode |
 | `W` | Toggle wireframe mesh |
+| `Shift+W` | Toggle surface mesh |
 | `D` | Done with lattice (save + exit lattice mode) |
 | `S` / `Cmd+S` | Save annotations + lattice |
 | `Right` / `]` | Next timepoint pair |
@@ -75,6 +77,7 @@ RegB/Decon_reg_100/Decon_reg_100_results/lattice_final/lattice_test.csv
 Single-file tool (`napari_worm.py`) built on Napari's viewer API:
 
 - `DualViewWindow` — Two independent `QtViewer` canvases in a `QSplitter`, with tabified dock widgets for panel switching
-- `WormAnnotator` — Main class handling annotation, lattice, and wireframe state
+- `WormAnnotator` — Main class handling annotation, lattice, wireframe, and surface state
 - `generate_wireframe_mesh()` — Builds 32 longitudinal splines from lattice L/R pairs using orthogonal frame construction (tangent from center spline derivative, right vector from L-to-R direction, up from cross product)
+- `generate_surface_mesh()` — Converts ellipse cross-sections into a triangle mesh `(vertices, faces, values)` for napari's `add_surface()`, matching MIPAV's `generateTriMesh()` vertex layout and face indexing
 

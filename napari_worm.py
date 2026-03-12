@@ -475,14 +475,14 @@ def generate_wireframe_mesh(left_pts: np.ndarray, right_pts: np.ndarray,
 
         # Worm diameter at this point (distance between L and R curves)
         diameter = np.linalg.norm(right_pt - left_pt)
-        # Major radius = half L/R distance; minor ≈ half major (MIPAV ellipse)
-        r_major = diameter / 2.0
-        r_minor = r_major / 2.0
+        # Radius = half L/R distance (circular cross-section, matching MIPAV
+        # updateEllipseModel → makeEllipse2DA with single radius)
+        radius = diameter / 2.0
 
-        # Generate ellipse points in the (right_vec, up_vec) plane
+        # Generate circle points in the (right_vec, up_vec) plane
         ring = np.empty((num_ellipse_pts, 3))
         for j in range(num_ellipse_pts):
-            ring[j] = center + r_major * cos_a[j] * right_vec + r_minor * sin_a[j] * up_vec
+            ring[j] = center + radius * cos_a[j] * right_vec + radius * sin_a[j] * up_vec
         ellipse_rings.append(ring)
 
     # --- Step 5: Fit longitudinal splines through corresponding ellipse points ---
@@ -503,6 +503,148 @@ def generate_wireframe_mesh(left_pts: np.ndarray, right_pts: np.ndarray,
         paths.append(closed_ring)
 
     return paths
+
+
+def generate_surface_mesh(left_pts: np.ndarray, right_pts: np.ndarray,
+                          num_ellipse_pts: int = 32,
+                          num_samples: int = 0):
+    """Generate a triangle mesh from lattice L/R points (MIPAV generateTriMesh).
+
+    Uses the same ellipse cross-section computation as generate_wireframe_mesh(),
+    then packs the rings into (vertices, faces, values) for napari add_surface().
+
+    Vertex layout (matches MIPAV LatticeModel.java:1454-1481):
+        [head_center, ring0_pt0..ring0_pt31, ring1_pt0..ring1_pt31, ..., tail_center]
+
+    Face construction (matches MIPAV LatticeModel.java:1483-1517):
+        - Head cap: triangle fan from head_center to first ring
+        - Body: adjacent rings connected by quads (2 triangles each)
+        - Tail cap: triangle fan from tail_center to last ring
+
+    Returns (vertices, faces, values) or None if insufficient data.
+    """
+    n = min(len(left_pts), len(right_pts))
+    if n < 3:
+        return None
+
+    # --- Reuse the same spline + ellipse computation as wireframe ---
+    centers = (left_pts[:n] + right_pts[:n]) / 2.0
+    center_cs, center_deriv = _make_spline_with_derivative(centers)
+    left_cs, _ = _make_spline_with_derivative(left_pts[:n])
+    right_cs, _ = _make_spline_with_derivative(right_pts[:n])
+    if center_cs is None or left_cs is None or right_cs is None:
+        return None
+
+    # Uniform sampling along center spline (1-voxel steps)
+    t_dense = np.linspace(0, 1, 500)
+    pts_dense = center_cs(t_dense)
+    arc_lengths = np.concatenate([[0], np.cumsum(
+        np.linalg.norm(np.diff(pts_dense, axis=0), axis=1))])
+    total_length = arc_lengths[-1]
+    if total_length < 1e-6:
+        return None
+
+    if num_samples <= 0:
+        num_samples = max(int(np.ceil(total_length)), 10)
+
+    target_arcs = np.linspace(0, total_length, num_samples)
+    t_uniform = np.interp(target_arcs, arc_lengths, t_dense)
+
+    # Build ellipse rings at each cross-section
+    angles = np.linspace(0, 2 * np.pi, num_ellipse_pts, endpoint=False)
+    cos_a = np.cos(angles)
+    sin_a = np.sin(angles)
+
+    ellipse_rings = []
+    for t_val in t_uniform:
+        center = center_cs(t_val)
+        tangent = center_deriv(t_val)
+        tangent_norm = np.linalg.norm(tangent)
+        if tangent_norm < 1e-12:
+            tangent = np.array([1.0, 0.0, 0.0])
+        else:
+            tangent = tangent / tangent_norm
+
+        left_pt = left_cs(t_val)
+        right_pt = right_cs(t_val)
+        right_vec = right_pt - left_pt
+        right_norm = np.linalg.norm(right_vec)
+        if right_norm < 1e-12:
+            if abs(tangent[0]) < 0.9:
+                right_vec = np.cross(tangent, np.array([1, 0, 0]))
+            else:
+                right_vec = np.cross(tangent, np.array([0, 1, 0]))
+            right_norm = np.linalg.norm(right_vec)
+
+        right_vec = right_vec / right_norm
+        right_vec = right_vec - np.dot(right_vec, tangent) * tangent
+        rn = np.linalg.norm(right_vec)
+        if rn < 1e-12:
+            if abs(tangent[0]) < 0.9:
+                right_vec = np.cross(tangent, np.array([1, 0, 0]))
+            else:
+                right_vec = np.cross(tangent, np.array([0, 1, 0]))
+            right_vec = right_vec / np.linalg.norm(right_vec)
+        else:
+            right_vec = right_vec / rn
+
+        up_vec = np.cross(tangent, right_vec)
+        up_vec = up_vec / np.linalg.norm(up_vec)
+
+        diameter = np.linalg.norm(right_pt - left_pt)
+        radius = diameter / 2.0
+
+        ring = np.empty((num_ellipse_pts, 3))
+        for j in range(num_ellipse_pts):
+            ring[j] = center + radius * cos_a[j] * right_vec + radius * sin_a[j] * up_vec
+        ellipse_rings.append(ring)
+
+    # --- Pack into (vertices, faces, values) matching MIPAV generateTriMesh ---
+    S = len(ellipse_rings)  # number of cross-sections
+    E = num_ellipse_pts     # points per ring
+
+    # Vertices: [head_center, ring0..ringS-1, tail_center]
+    head_center = ellipse_rings[0].mean(axis=0)
+    tail_center = ellipse_rings[-1].mean(axis=0)
+    vertices = np.empty((2 + S * E, 3))
+    vertices[0] = head_center
+    for i, ring in enumerate(ellipse_rings):
+        vertices[1 + i * E: 1 + (i + 1) * E] = ring
+    vertices[-1] = tail_center
+
+    # Faces
+    face_list = []
+
+    # Head cap: triangle fan from vertex 0 to first ring (MIPAV lines 1486-1492)
+    for j in range(E):
+        face_list.append([0, 1 + (j + 1) % E, 1 + j])
+
+    # Body: connect adjacent rings with quads → 2 triangles each (MIPAV lines 1494-1506)
+    for i in range(S - 1):
+        for j in range(E):
+            sj   = 1 + i * E + j
+            sj1  = 1 + i * E + (j + 1) % E
+            nj   = 1 + (i + 1) * E + j
+            nj1  = 1 + (i + 1) * E + (j + 1) % E
+            face_list.append([sj, nj1, nj])
+            face_list.append([sj, sj1, nj1])
+
+    # Tail cap: triangle fan from last vertex to last ring (MIPAV lines 1508-1514)
+    tail_idx = len(vertices) - 1
+    last_ring_start = 1 + (S - 1) * E
+    for j in range(E):
+        face_list.append([tail_idx, last_ring_start + j, last_ring_start + (j + 1) % E])
+
+    faces = np.array(face_list, dtype=np.int32)
+
+    # Values: arc-length parameter for colormap (head=0, tail=1)
+    values = np.empty(len(vertices))
+    values[0] = 0.0  # head center
+    for i in range(S):
+        values[1 + i * E: 1 + (i + 1) * E] = i / max(S - 1, 1)
+    values[-1] = 1.0  # tail center
+
+    return vertices, faces, values
 
 
 def load_annotations(filepath):
@@ -720,6 +862,7 @@ class WormAnnotator:
         print("  Cmd+Z             : undo last annotation/lattice point")
         print("  S                 : save annotations + lattice")
         print("  W                 : toggle wireframe mesh")
+        print("  Shift+W           : toggle surface mesh")
         print("-------------------\n")
 
     # ------------------------------------------------------------------ #
@@ -810,6 +953,8 @@ class WormAnnotator:
         self.lattice_right_curve_layers: list = [None, None]
         self.wireframe_layers: list = [None, None]
         self.wireframe_visible: bool = False
+        self.surface_layers: list = [None, None]
+        self.surface_visible: bool = False
         self.lattice_next_side: str = 'L'  # alternates L→R→L→R (nose to tail)
         self.lattice_last_placed: dict | None = None  # {'side_idx', 'timepoint', 'layer', 'char'}
         # Ordered list of pair metadata per timepoint:
@@ -849,6 +994,7 @@ class WormAnnotator:
         _sc('L',       self._toggle_lattice_mode)
         _sc('D',       self._on_lattice_done)
         _sc('W',       self._toggle_wireframe)
+        _sc('Shift+W', self._toggle_surface)
 
         # Event filter intercepts arrow keys BEFORE napari's canvas consumes them.
         # In lattice mode with a selected point → nudge; otherwise → navigate.
@@ -925,6 +1071,16 @@ class WormAnnotator:
             img = viewer_ref.add_image(
                 vol, name=f'Volume t={ti}', colormap='gray',
                 rendering='mip', contrast_limits=self.contrast_limits, multiscale=False)
+            # Surface layer: sits below all interactive layers so it never steals clicks
+            empty_verts = np.zeros((3, 3))
+            empty_faces = np.array([[0, 1, 2]])
+            empty_vals  = np.zeros(3)
+            surface = viewer_ref.add_surface(
+                (empty_verts, empty_faces, empty_vals),
+                name=f'Surface t={ti}', shading='smooth',
+                colormap='turbo', opacity=0.7)
+            surface.interactive = False
+            surface.visible = self.surface_visible
             pts = viewer_ref.add_points(
                 ndim=3, name=f'Annotations t={ti}', size=5, face_color='yellow')
             pts.mode = 'pan_zoom'  # prevent napari's native add-on-click
@@ -1097,6 +1253,7 @@ class WormAnnotator:
             self.lattice_left_curve_layers[side]  = lat_left_curve
             self.lattice_right_curve_layers[side] = lat_right_curve
             self.wireframe_layers[side] = wireframe
+            self.surface_layers[side] = surface
 
         self._nav_updating = True
         self._left_spin.setValue(t_left)
@@ -1337,6 +1494,20 @@ class WormAnnotator:
                     for path in paths:
                         if len(path) >= 2:
                             wf_layer.add(path, shape_type='path')
+
+        # --- Surface mesh (triangle mesh, Shift+W) ---
+        if self.surface_visible:
+            surf_layer = None
+            for side, ll in enumerate(self.lattice_left_layers):
+                if ll is lat_l:
+                    surf_layer = self.surface_layers[side]
+                    break
+            if surf_layer is not None and n >= 3:
+                left_data = np.asarray(lat_l.data)
+                right_data = np.asarray(lat_r.data)
+                result = generate_surface_mesh(left_data, right_data)
+                if result is not None:
+                    surf_layer.data = result
 
     @staticmethod
     def _save_csv_retry(df, path, retries=3):
@@ -1588,6 +1759,32 @@ class WormAnnotator:
         state = "ON" if self.wireframe_visible else "OFF"
         print(f"Wireframe: {state}")
         show_info(f"Wireframe: {state}")
+
+    def _toggle_surface(self):
+        """Toggle surface mesh visibility. Rebuilds mesh when turning on."""
+        self.surface_visible = not self.surface_visible
+        if self.surface_visible:
+            for ll, lr, llines, lmid, llc, lrc in zip(
+                    self.lattice_left_layers, self.lattice_right_layers,
+                    self.lattice_line_layers, self.lattice_mid_layers,
+                    self.lattice_left_curve_layers, self.lattice_right_curve_layers):
+                if ll is not None and lr is not None:
+                    self._update_lattice_visuals(ll, lr, llines, lmid, llc, lrc)
+        for sf in self.surface_layers:
+            if sf is not None:
+                sf.visible = self.surface_visible
+        if self.surface_visible:
+            print("=" * 50)
+            print("  SURFACE MESH: ON")
+            print("  Shift+W → toggle off")
+            print("  Rendered with smooth shading, turbo colormap")
+            print("=" * 50)
+            show_info("Surface: ON")
+        else:
+            print("=" * 50)
+            print("  SURFACE MESH: OFF")
+            print("=" * 50)
+            show_info("Surface: OFF")
 
     def _on_lattice_done(self):
         """Finalize the lattice — save and exit lattice mode."""
