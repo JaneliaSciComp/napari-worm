@@ -7,6 +7,8 @@ Usage:
     python napari_worm.py /path/to/directory/ --start 100         # start at timepoint 100
     python napari_worm.py /path/to/directory/ --no-grid           # dask 4D slider (fallback)
     python napari_worm.py /path/to/volume.tif -a existing.csv     # load existing annotations
+    python napari_worm.py /path/to/RegB/ --channels RegA,RegB    # explicit multi-channel
+    python napari_worm.py /path/to/RegB/ --start 100             # auto-discovers RegA if present
 """
 
 import argparse
@@ -55,6 +57,57 @@ def scan_time_series(directory: str | Path) -> list[Path]:
         raise FileNotFoundError(f"No .tif files found in {directory}")
     print(f"Found {len(filenames)} timepoints in {directory.name}")
     return filenames
+
+
+def _channel_colormap(name: str) -> str:
+    """Assign colormap by channel directory name (matching MIPAV conventions)."""
+    n = name.lower()
+    if '405' in n or 'blue' in n:
+        return 'blue'
+    if '488' in n or 'green' in n:
+        return 'green'
+    if '561' in n or 'red' in n:
+        return 'red'
+    if n == 'rega':
+        return 'red'
+    if n == 'regb':
+        return 'green'
+    return 'gray'
+
+
+def discover_channels(volume_path: Path, explicit: str | None = None) -> list[tuple[Path, str, str]]:
+    """Discover channel directories.
+
+    Returns list of (directory, name, colormap) tuples.
+    Single channel returns one entry with 'gray' colormap.
+    """
+    if explicit:
+        parent = volume_path.parent
+        channels = []
+        for ch_name in explicit.split(','):
+            ch_name = ch_name.strip()
+            ch_dir = parent / ch_name
+            if ch_dir.is_dir() and list(ch_dir.glob("*.tif"))[:1]:
+                channels.append((ch_dir, ch_name, _channel_colormap(ch_name)))
+            else:
+                print(f"Warning: channel dir not found or empty: {ch_dir}")
+        if channels:
+            return channels
+
+    # Auto-discover sibling directories that contain .tif files
+    parent = volume_path.parent
+    siblings = sorted([
+        d for d in parent.iterdir()
+        if d.is_dir() and d.name.startswith('Reg') and list(d.glob("*.tif"))[:1]
+    ], key=lambda d: d.name)
+
+    if len(siblings) >= 2:
+        channels = [(d, d.name, _channel_colormap(d.name)) for d in siblings]
+        print(f"Discovered {len(channels)} channels: {[c[1] for c in channels]}")
+        return channels
+
+    # Single channel — gray
+    return [(volume_path, volume_path.name, 'gray')]
 
 
 def load_time_series_dask(filenames: list[Path]) -> da.Array:
@@ -1178,12 +1231,14 @@ class DualViewWindow:
 class WormAnnotator:
     """Main annotation tool class."""
 
-    def __init__(self, volume_path, annotations_path=None, grid_mode=True, start_t=0):
+    def __init__(self, volume_path, annotations_path=None, grid_mode=True, start_t=0,
+                 channels=None):
         self.volume_path = Path(volume_path)
         self.annotations_path = annotations_path
         self.is_time_series = self.volume_path.is_dir()
         self.use_grid = grid_mode and self.is_time_series
         self.start_t = start_t
+        self.channels_arg = channels
 
         if self.use_grid:
             self._init_dual_window_mode()
@@ -1216,6 +1271,9 @@ class WormAnnotator:
         print("  W                 : toggle wireframe mesh")
         print("  Shift+W           : toggle surface mesh")
         print("  Histogram widget  : drag min/max slider for contrast")
+        if hasattr(self, 'multi_channel') and self.multi_channel:
+            ch_names = [c[1] for c in self.channels]
+            print(f"  Channels          : {ch_names} (click layer to switch histogram)")
         print("-------------------\n")
 
     # ------------------------------------------------------------------ #
@@ -1285,12 +1343,20 @@ class WormAnnotator:
         fill a horizontal QSplitter on the right.  Clicking either canvas
         switches the stacked widget via _CanvasClickFilter.
         """
-        self.tiff_files = scan_time_series(self.volume_path)
+        # Channel discovery: find sibling Reg* directories
+        self.channels = discover_channels(self.volume_path, self.channels_arg)
+        self.channel_tiff_files: list[list[Path]] = []
+        for ch_dir, ch_name, _ in self.channels:
+            self.channel_tiff_files.append(scan_time_series(ch_dir))
+        self.tiff_files = self.channel_tiff_files[0]  # primary channel for navigation
+        self.multi_channel = len(self.channels) > 1
+
         max_t = len(self.tiff_files) - 1
         start = min(self.start_t, max_t - 1)
 
         self.grid_annotations: dict[int, np.ndarray] = {}
         self.undo_stack: list[tuple[int, object]] = []
+        # For multi-channel: grid_image_layers[side] is a list of image layers (one per channel)
         self.grid_image_layers: list = [None, None]
         self.grid_points_layers: list = [None, None]
         self.grid_timepoints: list[int] = [start, min(start + 1, max_t)]
@@ -1317,8 +1383,14 @@ class WormAnnotator:
         self.lattice_seam_counter: dict[int, list[str]] = {}  # {timepoint: [used seam names]}
         self.lattice_undo_stack: list = []  # ('L'|'R', timepoint, layer)
 
-        first_vol = load_volume(self.tiff_files[start])
-        self.contrast_limits = [float(first_vol.min()), float(first_vol.max())]
+        # Per-channel contrast limits (keyed by channel name)
+        self.channel_contrast_limits: dict[str, list[float]] = {}
+        for ch_files, (_, ch_name, _) in zip(self.channel_tiff_files, self.channels):
+            first_vol = load_volume(ch_files[start])
+            self.channel_contrast_limits[ch_name] = [
+                float(first_vol.min()), float(first_vol.max())]
+        # Primary channel contrast for backward compat
+        self.contrast_limits = self.channel_contrast_limits[self.channels[0][1]]
 
         # Two independent napari viewers — hidden until embedded in DualViewWindow
         self.viewer_left  = napari.Viewer(ndisplay=3, show=False)
@@ -1408,6 +1480,27 @@ class WormAnnotator:
         layout.addStretch()
         return nav
 
+    def _find_peak_multi_channel(self, near, far, side):
+        """Find peak along ray across all channels (MIPAV winner-take-all)."""
+        best_peak = None
+        best_val = -1
+        img_layers = self.grid_image_layers[side]
+        if not isinstance(img_layers, list):
+            img_layers = [img_layers]
+        for img_lyr in img_layers:
+            if img_lyr is None:
+                continue
+            vol = np.asarray(img_lyr.data)
+            peak = find_peak_along_ray(vol, near, far)
+            idx = np.clip(np.round(peak).astype(int), 0, np.array(vol.shape) - 1)
+            val = vol[tuple(idx)]
+            if val > best_val:
+                best_val = val
+                best_peak = peak
+        if best_peak is None:
+            return (near + far) / 2
+        return best_peak
+
     def _load_dual_pair(self, t_left: int, t_right: int):
         """Load two timepoints into their respective viewers."""
         self._save_grid_annotations_to_cache()
@@ -1419,11 +1512,30 @@ class WormAnnotator:
 
         for side, (viewer_ref, ti) in enumerate(
                 [(self.viewer_left, t_left), (self.viewer_right, t_right)]):
-            vol = load_volume(self.tiff_files[ti])
 
-            img = viewer_ref.add_image(
-                vol, name=f'Volume t={ti}', colormap='gray',
-                rendering='mip', contrast_limits=self.contrast_limits, multiscale=False)
+            # Load all channels as separate image layers with additive blending
+            channel_img_layers = []
+            all_volumes = []
+            for ch_idx, (ch_files, (_, ch_name, ch_cmap)) in enumerate(
+                    zip(self.channel_tiff_files, self.channels)):
+                vol = load_volume(ch_files[ti])
+                all_volumes.append(vol)
+                # Single channel → gray, no blending change; multi → colored + additive
+                if self.multi_channel:
+                    cmap = ch_cmap
+                    blending = 'additive'
+                    layer_name = f'{ch_name} t={ti}'
+                else:
+                    cmap = 'gray'
+                    blending = 'translucent'
+                    layer_name = f'Volume t={ti}'
+                clim = self.channel_contrast_limits[ch_name]
+                img = viewer_ref.add_image(
+                    vol, name=layer_name, colormap=cmap,
+                    rendering='mip', contrast_limits=clim,
+                    blending=blending, multiscale=False)
+                channel_img_layers.append(img)
+
             # Surface layer: sits below all interactive layers so it never steals clicks
             empty_verts = np.zeros((3, 3))
             empty_faces = np.array([[0, 1, 2]])
@@ -1480,8 +1592,11 @@ class WormAnnotator:
             self._update_lattice_visuals(lat_l, lat_r, lat_lines, lat_mid,
                                         lat_left_curve, lat_right_curve)
 
+            # Use first channel's image layer as the ray-intersection reference
+            img_ref = channel_img_layers[0]
+
             # Each viewer handles only its own canvas — no click-routing needed
-            def make_handler(volume_data, side_idx, timepoint,
+            def make_handler(side_idx, timepoint,
                              img_ref, pts_ref,
                              lat_l_ref, lat_r_ref, lat_lines_ref, lat_mid_ref,
                              lat_lc_ref, lat_rc_ref):
@@ -1489,7 +1604,7 @@ class WormAnnotator:
                     if 'Control' not in event.modifiers:
                         return
                     if not self.lattice_mode:
-                        self._on_click_dual(img_ref, event, volume_data,
+                        self._on_click_dual(img_ref, event,
                                             side_idx, timepoint, pts_ref)
                         return
 
@@ -1497,17 +1612,15 @@ class WormAnnotator:
                         event.position, event.view_direction, event.dims_displayed)
                     if near is None or far is None:
                         return
+                    peak = self._find_peak_multi_channel(near, far, side_idx)
                     pos = find_nucleus_centroid(
-                        volume_data, find_peak_along_ray(volume_data, near, far))
+                        np.asarray(img_ref.data), peak)
 
                     n_l = len(lat_l_ref.data)
                     n_r = len(lat_r_ref.data)
                     n_complete = min(n_l, n_r)
 
                     # --- Check for nearby existing point (select / drag) ---
-                    # Use ray-to-point distance: if the camera ray passes within
-                    # 12 voxels of any lattice point, select it. This works for
-                    # interpolated points in empty space (centroid shift doesn't matter).
                     drag_target = None
                     if n_l > 0 or n_r > 0:
                         l_data = np.asarray(lat_l_ref.data) if n_l > 0 else np.empty((0, 3))
@@ -1536,16 +1649,14 @@ class WormAnnotator:
                                 lat_lc_ref, lat_rc_ref)
                             return
                         else:
-                            # Not near any curve — append new point
-                            self._on_lattice_click(img_ref, event, volume_data,
+                            self._on_lattice_click(img_ref, event, None,
                                                    side_idx, timepoint,
                                                    lat_l_ref, lat_r_ref,
                                                    lat_lines_ref, lat_mid_ref,
                                                    lat_lc_ref, lat_rc_ref)
                             return
                     else:
-                        # <2 complete pairs — just append
-                        self._on_lattice_click(img_ref, event, volume_data,
+                        self._on_lattice_click(img_ref, event, None,
                                                side_idx, timepoint,
                                                lat_l_ref, lat_r_ref,
                                                lat_lines_ref, lat_mid_ref,
@@ -1572,7 +1683,7 @@ class WormAnnotator:
                         near2, far2 = img_ref.get_ray_intersections(
                             event.position, event.view_direction, event.dims_displayed)
                         if near2 is not None and far2 is not None:
-                            new_pos = find_peak_along_ray(volume_data, near2, far2)
+                            new_pos = self._find_peak_multi_channel(near2, far2, side_idx)
                             pts = drag_layer.data.copy()
                             pts[pt_idx] = new_pos
                             drag_layer.data = pts
@@ -1590,14 +1701,17 @@ class WormAnnotator:
 
                 return handler
 
-            cb = make_handler(vol, side, ti, img, pts, lat_l, lat_r, lat_lines, lat_mid,
+            cb = make_handler(side, ti, img_ref, pts, lat_l, lat_r, lat_lines, lat_mid,
                               lat_left_curve, lat_right_curve)
             # Register on ALL layers so Cmd+Click works regardless of sidebar selection
-            for lyr in (img, pts, lat_l, lat_r, lat_lines, lat_mid,
-                        lat_left_curve, lat_right_curve, wireframe):
+            all_interactive = list(channel_img_layers) + [
+                pts, lat_l, lat_r, lat_lines, lat_mid,
+                lat_left_curve, lat_right_curve, wireframe]
+            for lyr in all_interactive:
                 lyr.mouse_drag_callbacks.append(cb)
 
-            self.grid_image_layers[side]  = img
+            # Store image layers: list for multi-channel, single for compat
+            self.grid_image_layers[side] = channel_img_layers if self.multi_channel else channel_img_layers[0]
             self.grid_points_layers[side] = pts
             self.lattice_left_layers[side]  = lat_l
             self.lattice_right_layers[side] = lat_r
@@ -1613,16 +1727,15 @@ class WormAnnotator:
         self._right_spin.setValue(t_right)
         self._nav_updating = False
 
+        ch_info = f"  channels: {[c[1] for c in self.channels]}" if self.multi_channel else ""
         self.dual_window.setWindowTitle(
             f"napari_worm  —  t={t_left} (left)  |  t={t_right} (right)  "
-            f"[of {len(self.tiff_files)-1}]")
+            f"[of {len(self.tiff_files)-1}]{ch_info}")
         print(f"Showing t={t_left} (left) and t={t_right} (right) of {len(self.tiff_files)-1}")
 
-        # Update histogram LUT widgets — one per viewer/side
-        if self.grid_image_layers[0] is not None:
-            self.dual_window.histogram_left.set_layer(self.grid_image_layers[0])
-        if self.grid_image_layers[1] is not None:
-            self.dual_window.histogram_right.set_layer(self.grid_image_layers[1])
+        # Update histogram LUT widgets — bind to first channel's image layer,
+        # or connect to active layer selection for multi-channel switching
+        self._update_histograms()
 
     def _save_grid_annotations_to_cache(self):
         for side, pts in enumerate(self.grid_points_layers):
@@ -1642,6 +1755,47 @@ class WormAnnotator:
                 entry['left']  = lat_l.data.copy()
             if lat_r is not None and len(lat_r.data) > 0:
                 entry['right'] = lat_r.data.copy()
+
+    def _update_histograms(self):
+        """Bind histogram widgets to image layers after loading a timepoint pair."""
+        if self.multi_channel:
+            # Multi-channel: bind to first channel initially, then switch on
+            # active layer selection (clicking a channel in the layer list)
+            for side, (viewer_ref, hist_widget) in enumerate([
+                (self.viewer_left, self.dual_window.histogram_left),
+                (self.viewer_right, self.dual_window.histogram_right),
+            ]):
+                img_layers = self.grid_image_layers[side]
+                if isinstance(img_layers, list) and img_layers:
+                    hist_widget.set_layer(img_layers[0])
+                    # Connect active layer selection to histogram switching
+                    self._connect_layer_selection(viewer_ref, hist_widget, img_layers)
+        else:
+            # Single channel: same as before
+            img_l = self.grid_image_layers[0]
+            img_r = self.grid_image_layers[1]
+            if img_l is not None:
+                self.dual_window.histogram_left.set_layer(img_l)
+            if img_r is not None:
+                self.dual_window.histogram_right.set_layer(img_r)
+
+    def _connect_layer_selection(self, viewer, hist_widget, img_layers):
+        """When user selects a different image layer, update histogram."""
+        img_layer_set = set(id(lyr) for lyr in img_layers)
+
+        def on_active_changed(event):
+            active = viewer.layers.selection.active
+            if active is not None and id(active) in img_layer_set:
+                hist_widget.set_layer(active)
+
+        # Disconnect any previous handler to avoid stacking
+        try:
+            viewer.layers.selection.events.active.disconnect(
+                getattr(viewer, '_ch_hist_handler', None))
+        except (TypeError, RuntimeError):
+            pass
+        viewer._ch_hist_handler = on_active_changed
+        viewer.layers.selection.events.active.connect(on_active_changed)
 
     def _toggle_lattice_mode(self):
         self.lattice_mode = not self.lattice_mode
@@ -1668,7 +1822,7 @@ class WormAnnotator:
             print("=" * 50)
             show_info("ANNOTATION MODE")
 
-    def _on_lattice_click(self, img_layer, event, volume_data,
+    def _on_lattice_click(self, img_layer, event, _volume_data_unused,
                           side_idx, timepoint,
                           lat_left_layer, lat_right_layer,
                           lat_lines_layer, lat_mid_layer,
@@ -1680,7 +1834,8 @@ class WormAnnotator:
             if near is None or far is None:
                 print("[lattice] ray missed volume — click closer to the worm")
                 return
-            pos = find_nucleus_centroid(volume_data, find_peak_along_ray(volume_data, near, far))
+            peak = self._find_peak_multi_channel(near, far, side_idx)
+            pos = find_nucleus_centroid(np.asarray(img_layer.data), peak)
             canvas_label = "left" if side_idx == 0 else "right"
 
             is_seam = 'Shift' in event.modifiers
@@ -1948,12 +2103,13 @@ class WormAnnotator:
             return
         self._load_dual_pair(t_left - 1, t_right - 1)
 
-    def _on_click_dual(self, layer, event, volume_data, side_idx, timepoint, points_layer):
+    def _on_click_dual(self, layer, event, side_idx, timepoint, points_layer):
         near, far = layer.get_ray_intersections(
             event.position, event.view_direction, event.dims_displayed)
         if near is None or far is None:
             return
-        pos = find_nucleus_centroid(volume_data, find_peak_along_ray(volume_data, near, far))
+        peak = self._find_peak_multi_channel(near, far, side_idx)
+        pos = find_nucleus_centroid(np.asarray(layer.data), peak)
         points_layer.add(pos)
         self.undo_stack.append((timepoint, points_layer))
         label = "left" if side_idx == 0 else "right"
@@ -2213,10 +2369,14 @@ def main():
                         help="Use dask 4D slider instead of dual window mode")
     parser.add_argument("--start", "-s", type=int, default=0,
                         help="Starting timepoint index (default: 0)")
+    parser.add_argument("--channels", "-c", default=None,
+                        help="Comma-separated channel dir names (e.g. RegA,RegB). "
+                             "Auto-discovered if omitted.")
     args = parser.parse_args()
 
     WormAnnotator(args.volume, args.annotations,
-                  grid_mode=not args.no_grid, start_t=args.start).run()
+                  grid_mode=not args.no_grid, start_t=args.start,
+                  channels=args.channels).run()
 
 
 if __name__ == "__main__":

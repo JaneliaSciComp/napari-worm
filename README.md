@@ -10,6 +10,8 @@ Developed at the **Shroff Lab**, Janelia Research Campus.
 
 - **3D click-to-annotate**: Cmd+Click places markers at peak intensity along the camera ray (gradient ascent + intensity-weighted centroid for sub-voxel accuracy)
 - **MIPAV-style dual view**: Two consecutive timepoints side-by-side with independent 3D canvases and linked navigation
+- **Multi-channel support**: Auto-discovers RegA/RegB (or wavelength 405/488/561/637) channels and overlays them with additive blending (red + green). Per-channel histogram/contrast controls. Peak detection uses winner-take-all across all channels, matching MIPAV's hyperstack behavior.
+- **Histogram + contrast controls**: MIPAV-style transfer function widget with 4 draggable control points, log scale, and per-channel colormap-aware display
 - **Lattice mode**: Build left/right lattice pairs (nose-to-tail), with smooth natural cubic spline curves matching MIPAV's `NaturalSpline3(BT_FREE)`
 - **Seam cells**: Cmd+Shift+Click to mark seam cells (H0, H1, H2, V1-V6, T) with automatic MIPAV-compatible naming
 - **Insert / drag / nudge**: Click on curves to insert pairs, drag points to reposition, arrow keys to nudge by 1 voxel
@@ -36,6 +38,13 @@ pixi install
 ```bash
 # Dual-view mode (two consecutive timepoints side-by-side):
 pixi run python napari_worm.py /path/to/RegB/ --start 100
+
+# Multi-channel (auto-discovers sibling Reg* directories):
+pixi run python napari_worm.py /path/to/For_Tracking/RegB/ --start 100
+# ^ auto-detects RegA alongside RegB → red/green overlay
+
+# Explicit channel selection:
+pixi run python napari_worm.py /path/to/RegB/ --channels RegA,RegB --start 100
 
 # Single file mode:
 pixi run python napari_worm.py /path/to/volume.tif
