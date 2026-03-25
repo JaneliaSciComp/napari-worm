@@ -900,9 +900,15 @@ class HistogramLUTWidget(QWidget):
                     self._on_layer_contrast_changed)
             except (TypeError, RuntimeError):
                 pass
+            try:
+                self._layer.events.colormap.disconnect(
+                    self._on_layer_colormap_changed)
+            except (TypeError, RuntimeError):
+                pass
         self._layer = layer
         if layer is not None:
             layer.events.contrast_limits.connect(self._on_layer_contrast_changed)
+            layer.events.colormap.connect(self._on_layer_colormap_changed)
             self._update_lut_bar_colormap()
             self._compute_histogram()
             self._redraw_histogram()
@@ -972,12 +978,17 @@ class HistogramLUTWidget(QWidget):
             h = norm_counts[i:end_i].max()
             cx = bin_centers[i:end_i].mean()
             w = bin_width * step
-            # Color: map bin intensity position to red brightness
+            # Color: map bin intensity position through channel colormap
             t = (cx - self._data_min) / (self._data_max - self._data_min)
-            r = int(40 + t * 200)  # 40 (dark red) → 240 (bright red)
+            cmap = self._layer.colormap if self._layer is not None else None
+            if cmap is not None:
+                rgba = cmap.map(np.array([max(0.15, t)]))[0]  # floor at 0.15 so dark end stays visible
+                r, g, b = int(rgba[0]*255), int(rgba[1]*255), int(rgba[2]*255)
+            else:
+                r, g, b = int(40 + t * 200), 10, 10
             bar = pg.BarGraphItem(
                 x=[cx], height=[h], width=w,
-                brush=pg.mkBrush(r, 10, 10, 180),
+                brush=pg.mkBrush(r, g, b, 180),
                 pen=pg.mkPen(None))
             self._plot.addItem(bar)
             self._hist_bar_items.append(bar)
@@ -1105,6 +1116,11 @@ class HistogramLUTWidget(QWidget):
     def _on_layer_contrast_changed(self, event=None):
         """Called when napari's built-in slider changes contrast_limits."""
         self._sync_points_from_layer()
+
+    def _on_layer_colormap_changed(self, event=None):
+        """Called when the layer's colormap changes — redraw bars and LUT bar."""
+        self._update_lut_bar_colormap()
+        self._redraw_histogram()
 
 
 class DualViewWindow:
@@ -1789,12 +1805,15 @@ class WormAnnotator:
                 hist_widget.set_layer(active)
 
         # Disconnect any previous handler to avoid stacking
-        try:
-            viewer.layers.selection.events.active.disconnect(
-                getattr(viewer, '_ch_hist_handler', None))
-        except (TypeError, RuntimeError):
-            pass
-        viewer._ch_hist_handler = on_active_changed
+        if not hasattr(self, '_ch_hist_handlers'):
+            self._ch_hist_handlers = {}
+        prev = self._ch_hist_handlers.get(id(viewer))
+        if prev is not None:
+            try:
+                viewer.layers.selection.events.active.disconnect(prev)
+            except (TypeError, RuntimeError):
+                pass
+        self._ch_hist_handlers[id(viewer)] = on_active_changed
         viewer.layers.selection.events.active.connect(on_active_changed)
 
     def _toggle_lattice_mode(self):
