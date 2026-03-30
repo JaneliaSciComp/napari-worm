@@ -1238,7 +1238,7 @@ class DualViewWindow:
             lat_table.setHorizontalHeaderLabels(
                 ["Pair", "L_X", "L_Y", "L_Z", "R_X", "R_Y", "R_Z"])
             lat_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-            lat_table.setEditTriggers(QTableWidget.NoEditTriggers)
+            lat_table.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.SelectedClicked)
             lat_table.setSelectionBehavior(QTableWidget.SelectRows)
             lat_table.verticalHeader().setVisible(False)
             tables_layout.addWidget(lat_table, stretch=1)
@@ -1508,6 +1508,8 @@ class WormAnnotator:
                 lambda row, col, prev_row, prev_col, s=side:
                     self._on_annotation_row_selected(s, row))
             lat_table = self.dual_window.lattice_tables[side]
+            lat_table.cellChanged.connect(
+                lambda row, col, s=side: self._on_lattice_table_edited(s, row, col))
             lat_table.currentCellChanged.connect(
                 lambda row, col, prev_row, prev_col, s=side:
                     self._on_lattice_row_selected(s, row, col))
@@ -1937,15 +1939,17 @@ class WormAnnotator:
         segments = self.grid_annotation_segments.get(ti, [])
         table.setRowCount(len(data))
         for i, (z, y, x) in enumerate(data):
-            # Name, X, Y, Z — read-only
-            for col, text in enumerate([f"A{i}", f"{x:.1f}", f"{y:.1f}", f"{z:.1f}"]):
-                item = QTableWidgetItem(text)
-                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-                table.setItem(i, col, item)
+            # Name — read-only
+            name_item = QTableWidgetItem(f"A{i}")
+            name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)
+            table.setItem(i, 0, name_item)
+            # X, Y, Z — editable
+            table.setItem(i, 1, QTableWidgetItem(f"{x:.1f}"))
+            table.setItem(i, 2, QTableWidgetItem(f"{y:.1f}"))
+            table.setItem(i, 3, QTableWidgetItem(f"{z:.1f}"))
             # Seg — editable
             seg_val = segments[i] if i < len(segments) else -1
-            seg_item = QTableWidgetItem("" if seg_val == -1 else str(seg_val))
-            table.setItem(i, 4, seg_item)
+            table.setItem(i, 4, QTableWidgetItem("" if seg_val == -1 else str(seg_val)))
         table.blockSignals(False)
 
     def _refresh_lattice_table(self, side: int):
@@ -1953,11 +1957,13 @@ class WormAnnotator:
         table = self.dual_window.lattice_tables[side]
         if table is None:
             return
+        table.blockSignals(True)
         ti = self.grid_timepoints[side] if side < len(self.grid_timepoints) else None
         lat_l = self.lattice_left_layers[side]
         lat_r = self.lattice_right_layers[side]
         if lat_l is None or (len(lat_l.data) == 0 and (lat_r is None or len(lat_r.data) == 0)):
             table.setRowCount(0)
+            table.blockSignals(False)
             return
         l_data = np.asarray(lat_l.data) if len(lat_l.data) > 0 else np.empty((0, 3))
         r_data = np.asarray(lat_r.data) if lat_r is not None and len(lat_r.data) > 0 else np.empty((0, 3))
@@ -1965,38 +1971,119 @@ class WormAnnotator:
         n_rows = max(len(l_data), len(r_data))
         table.setRowCount(n_rows)
         for i in range(n_rows):
+            # Pair name — read-only
             name = pair_names[i]['name'] if i < len(pair_names) else f"a{i}"
-            table.setItem(i, 0, QTableWidgetItem(name))
+            name_item = QTableWidgetItem(name)
+            name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)
+            table.setItem(i, 0, name_item)
+            # L coords — editable
             if i < len(l_data):
                 z, y, x = l_data[i]
                 table.setItem(i, 1, QTableWidgetItem(f"{x:.1f}"))
                 table.setItem(i, 2, QTableWidgetItem(f"{y:.1f}"))
                 table.setItem(i, 3, QTableWidgetItem(f"{z:.1f}"))
+            # R coords — editable
             if i < len(r_data):
                 z, y, x = r_data[i]
                 table.setItem(i, 4, QTableWidgetItem(f"{x:.1f}"))
                 table.setItem(i, 5, QTableWidgetItem(f"{y:.1f}"))
                 table.setItem(i, 6, QTableWidgetItem(f"{z:.1f}"))
+        table.blockSignals(False)
 
     def _on_annotation_table_edited(self, side: int, row: int, col: int):
-        """Handle user editing the Seg column in the annotation table."""
-        if col != 4:  # only Seg column is editable
+        """Handle user editing X/Y/Z or Seg columns in the annotation table."""
+        if col == 0:  # Name is read-only
             return
-        ti = self.grid_timepoints[side]
-        segments = self.grid_annotation_segments.setdefault(ti, [])
-        # Extend segments list if needed
-        while len(segments) <= row:
-            segments.append(-1)
-        item = self.dual_window.annotation_tables[side].item(row, 4)
-        text = item.text().strip() if item else ""
+        table = self.dual_window.annotation_tables[side]
+        item = table.item(row, col)
+        if item is None:
+            return
+        text = item.text().strip()
+
+        if col == 4:  # Seg column
+            ti = self.grid_timepoints[side]
+            segments = self.grid_annotation_segments.setdefault(ti, [])
+            while len(segments) <= row:
+                segments.append(-1)
+            try:
+                segments[row] = int(text) if text else -1
+            except ValueError:
+                segments[row] = -1
+                table.blockSignals(True)
+                item.setText("")
+                table.blockSignals(False)
+            return
+
+        # X/Y/Z coordinate edit (cols 1-3)
+        pts_layer = self.grid_points_layers[side]
+        if pts_layer is None or row >= len(pts_layer.data):
+            return
         try:
-            segments[row] = int(text) if text else -1
+            val = float(text)
         except ValueError:
-            segments[row] = -1
-            # Reset the cell to blank on invalid input
-            self.dual_window.annotation_tables[side].blockSignals(True)
-            item.setText("")
-            self.dual_window.annotation_tables[side].blockSignals(False)
+            return
+        pts = pts_layer.data.copy()
+        old_val = pts[row].copy()
+        # Table cols: 1=X, 2=Y, 3=Z → data indices: X=col2, Y=col1, Z=col0
+        if col == 1:
+            pts[row][2] = val  # X
+        elif col == 2:
+            pts[row][1] = val  # Y
+        elif col == 3:
+            pts[row][0] = val  # Z
+        pts_layer.data = pts
+        ti = self.grid_timepoints[side]
+        self.undo_stack.append(('TABLE_ANN', ti, side, row, old_val))
+
+    def _on_lattice_table_edited(self, side: int, row: int, col: int):
+        """Handle user editing coordinate columns in the lattice table."""
+        if col == 0:  # Pair name is read-only
+            return
+        table = self.dual_window.lattice_tables[side]
+        item = table.item(row, col)
+        if item is None:
+            return
+        try:
+            val = float(item.text().strip())
+        except ValueError:
+            return
+        # Cols 1-3 = left (L_X, L_Y, L_Z), cols 4-6 = right (R_X, R_Y, R_Z)
+        if col <= 3:
+            layer = self.lattice_left_layers[side]
+            coord_col = col  # 1=X, 2=Y, 3=Z
+        else:
+            layer = self.lattice_right_layers[side]
+            coord_col = col - 3  # 4→1=X, 5→2=Y, 6→3=Z
+        if layer is None or row >= len(layer.data):
+            return
+        pts = layer.data.copy()
+        old_val = pts[row].copy()
+        if coord_col == 1:
+            pts[row][2] = val  # X
+        elif coord_col == 2:
+            pts[row][1] = val  # Y
+        elif coord_col == 3:
+            pts[row][0] = val  # Z
+        layer.data = pts
+        ti = self.grid_timepoints[side]
+        lr_char = 'L' if col <= 3 else 'R'
+        self.lattice_undo_stack.append(('TABLE_LAT', ti, (layer, row, old_val)))
+        # Update lattice visuals and cache
+        ti = self.grid_timepoints[side]
+        for ll, lr, llines, lmid, llc, lrc in zip(
+                self.lattice_left_layers, self.lattice_right_layers,
+                self.lattice_line_layers, self.lattice_mid_layers,
+                self.lattice_left_curve_layers, self.lattice_right_curve_layers):
+            if ll is self.lattice_left_layers[side]:
+                self._update_lattice_visuals(ll, lr, llines, lmid, llc, lrc)
+                break
+        entry = self.lattice_annotations.setdefault(ti, {})
+        lat_l = self.lattice_left_layers[side]
+        lat_r = self.lattice_right_layers[side]
+        if lat_l is not None and len(lat_l.data) > 0:
+            entry['left'] = lat_l.data.copy()
+        if lat_r is not None and len(lat_r.data) > 0:
+            entry['right'] = lat_r.data.copy()
 
     def _highlight_point(self, layer, index, default_color, default_size):
         """Make one point stand out with a white edge ring and larger size."""
@@ -2416,7 +2503,21 @@ class WormAnnotator:
         if not self.undo_stack:
             print("Nothing to undo")
             return
-        timepoint, pts = self.undo_stack.pop()
+        entry = self.undo_stack.pop()
+
+        # Handle table coordinate edit undo
+        if isinstance(entry, tuple) and len(entry) == 5 and entry[0] == 'TABLE_ANN':
+            _, ti, side, row, old_val = entry
+            pts_layer = self.grid_points_layers[side]
+            if pts_layer is not None and row < len(pts_layer.data):
+                pts = pts_layer.data.copy()
+                pts[row] = old_val
+                pts_layer.data = pts
+                print(f"[t={ti}] Undid table edit on A{row}")
+                self._refresh_tables()
+            return
+
+        timepoint, pts = entry
         active = [p for p in self.grid_points_layers if p is not None]
         if any(p is pts for p in active) and len(pts.data) > 0:
             pts.data = pts.data[:-1]
@@ -2449,6 +2550,33 @@ class WormAnnotator:
         undo_entry = self.lattice_undo_stack.pop()
         side_char = undo_entry[0]
         timepoint = undo_entry[1]
+
+        if side_char == 'TABLE_LAT':
+            # Undo a lattice table coordinate edit
+            layer, row, old_val = undo_entry[2]
+            if layer is not None and row < len(layer.data):
+                pts = layer.data.copy()
+                pts[row] = old_val
+                layer.data = pts
+                for ll, lr, llines, lmid, llc, lrc in zip(
+                        self.lattice_left_layers, self.lattice_right_layers,
+                        self.lattice_line_layers, self.lattice_mid_layers,
+                        self.lattice_left_curve_layers, self.lattice_right_curve_layers):
+                    if ll is layer or lr is layer:
+                        self._update_lattice_visuals(ll, lr, llines, lmid, llc, lrc)
+                        break
+                entry = self.lattice_annotations.setdefault(timepoint, {})
+                for side, lat_l in enumerate(self.lattice_left_layers):
+                    if lat_l is layer:
+                        entry['left'] = layer.data.copy()
+                        break
+                for side, lat_r in enumerate(self.lattice_right_layers):
+                    if lat_r is layer:
+                        entry['right'] = layer.data.copy()
+                        break
+                print(f"[t={timepoint}] Undid lattice table edit")
+                self._refresh_tables()
+            return
 
         if side_char == 'INSERT':
             # Undo a full pair insertion
