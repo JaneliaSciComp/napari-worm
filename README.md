@@ -22,15 +22,26 @@ Developed at the **Shroff Lab**, Janelia Research Campus.
 - **MIPAV-compatible output**: Saves `annotations_test.csv` and `lattice_test.csv` per timepoint in the expected directory structure
 - **Toast notifications**: In-app notifications for save confirmations, mode changes, and seam cell placement
 
-## Requirements
+## Quick Install (one command)
 
-- macOS (for Napari GUI)
-- [Pixi](https://pixi.sh) package manager
+**macOS** (paste in Terminal):
+```bash
+curl -fsSL https://raw.githubusercontent.com/JaneliaSciComp/napari-worm/main/install.sh | bash
+```
 
-## Installation
+**Windows** (paste in PowerShell):
+```powershell
+irm https://raw.githubusercontent.com/JaneliaSciComp/napari-worm/main/install.ps1 | iex
+```
+
+This installs [Pixi](https://pixi.sh) (if needed), clones the repo, and sets up all dependencies. Run the same command again to update.
+
+**Prerequisites**: Git ([Windows download](https://git-scm.com/download/win), pre-installed on macOS) and NRS drive access.
+
+## Manual Installation
 
 ```bash
-git clone git@github.com:JaneliaSciComp/napari-worm.git
+git clone https://github.com/JaneliaSciComp/napari-worm.git
 cd napari-worm
 pixi install
 ```
@@ -62,8 +73,8 @@ pixi run python napari_worm.py /path/to/RegB/ --no-grid
 
 | Key | Action |
 |-----|--------|
-| `Cmd+Click` | Annotate at peak intensity (annotation mode) / place lattice point (lattice mode) |
-| `Cmd+Shift+Click` | Place seam cell (lattice mode) |
+| `Cmd+Click` (macOS) / `Ctrl+Click` (Windows) | Annotate at peak intensity (annotation mode) / place lattice point (lattice mode) |
+| `Cmd+Shift+Click` (macOS) / `Ctrl+Shift+Click` (Windows) | Place seam cell (lattice mode) |
 | `L` | Toggle lattice mode |
 | `W` | Toggle wireframe mesh |
 | `Shift+W` | Toggle surface mesh |
