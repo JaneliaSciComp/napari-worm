@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "3D cell annotation tool for C. elegans using Napari"
 authors = ["Diyi Chen <chend@janelia.hhmi.org>"]
 channels = ["conda-forge"]
-platforms = ["linux-64", "osx-arm64", "osx-64"]
+platforms = ["linux-64", "osx-arm64", "osx-64", "win-64"]
 
 [dependencies]
 python = "=3.11"
@@ -19,3 +19,4 @@ matplotlib = ">=3.8"
 ipykernel = ">=6.31.0,<7"
 pyqtgraph = ">=0.13"
 superqt = ">=0.6"
+pixi-pack = ">=0.7.6,<0.8"
