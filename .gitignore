@@ -18,3 +18,8 @@ PROJECT_PLAN.md
 # Temp data
 *.csv
 !examples/*.csv
+dist/
+napari-worm-*.sh
+napari-worm-*.ps1
+launch.sh
+launch.bat
