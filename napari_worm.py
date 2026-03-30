@@ -782,6 +782,8 @@ class _CanvasClickFilter(QObject):
             # run inside the GL canvas's own mouse-press handler (which causes
             # a freeze on macOS when the dock resize triggers a GL repaint).
             QTimer.singleShot(0, lambda: self._dual_window.set_active_side(self._side))
+            # Clear table highlights when clicking on the canvas
+            QTimer.singleShot(0, lambda: self._dual_window.clear_all_highlights())
         return False  # pass event through
 
 
@@ -1161,6 +1163,7 @@ class DualViewWindow:
         self._qt_left  = viewer_left.window._qt_viewer
         self._qt_right = viewer_right.window._qt_viewer
         self._active_side = 0  # track current side to avoid redundant show/hide
+        self._annotator = None  # set by WormAnnotator after construction
         # Reuse viewer_left's native napari window — correct stylesheet, menubar,
         # status bar, console button, and dock area all work out of the box.
         self._host = viewer_left.window._qt_window
@@ -1302,6 +1305,20 @@ class DualViewWindow:
         else:
             self._qt_right.dockLayerControls.raise_()
             self._qt_right.dockLayerList.raise_()
+
+    def clear_all_highlights(self):
+        """Clear table-driven highlights on all point layers."""
+        if self._annotator is None:
+            return
+        ann = self._annotator
+        for side in range(2):
+            ann._clear_highlight(ann.grid_points_layers[side], 'yellow', 5)
+            ann._clear_highlight(ann.lattice_left_layers[side], 'cyan', 7)
+            ann._clear_highlight(ann.lattice_right_layers[side], 'magenta', 7)
+        # Also deselect table rows
+        for table in self.annotation_tables + self.lattice_tables:
+            if table is not None:
+                table.clearSelection()
 
 
 # ---------------------------------------------------------------------------
@@ -1480,6 +1497,7 @@ class WormAnnotator:
 
         # Build the single main window (MIPAV's JFrame equivalent)
         self.dual_window = DualViewWindow(self.viewer_left, self.viewer_right, nav_widget)
+        self.dual_window._annotator = self
 
         # Connect annotation table edits (Seg column) and row selection
         for side in range(2):
