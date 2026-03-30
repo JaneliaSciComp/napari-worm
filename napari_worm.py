@@ -129,17 +129,20 @@ def load_time_series_dask(filenames: list[Path]) -> da.Array:
 # ---------------------------------------------------------------------------
 
 def sample_ray(data, start, end, n_samples=None):
+    """Walk a ray through the volume, sampling via trilinear interpolation.
+
+    Matches MIPAV's accurate mode (getFloatTriLinearBounds) — samples at
+    continuous float coordinates instead of snapping to nearest voxel.
+    """
     if n_samples is None:
         n_samples = int(np.linalg.norm(end - start)) + 1
     positions = np.linspace(start, end, n_samples)
-    values = []
-    for pos in positions:
-        idx = np.round(pos).astype(int)
-        if np.all(idx >= 0) and np.all(idx < data.shape):
-            values.append(data[tuple(idx)])
-        else:
-            values.append(0)
-    return positions, np.array(values)
+    from scipy.ndimage import map_coordinates
+    # map_coordinates expects shape (ndim, npts) with coords in z,y,x order
+    coords = positions.T  # (3, n_samples)
+    values = map_coordinates(data.astype(np.float64), coords, order=1,
+                             mode='constant', cval=0.0)
+    return positions, values
 
 
 def find_peak_along_ray(data, start, end):
@@ -1461,14 +1464,10 @@ class WormAnnotator:
         self.lattice_seam_counter: dict[int, list[str]] = {}  # {timepoint: [used seam names]}
         self.lattice_undo_stack: list = []  # ('L'|'R', timepoint, layer)
 
-        # Per-channel contrast limits (keyed by channel name)
+        # Per-channel contrast limits — initialized lazily in _load_dual_pair
+        # on first load to avoid redundant volume reads at startup
         self.channel_contrast_limits: dict[str, list[float]] = {}
-        for ch_files, (_, ch_name, _) in zip(self.channel_tiff_files, self.channels):
-            first_vol = load_volume(ch_files[start])
-            self.channel_contrast_limits[ch_name] = [
-                float(first_vol.min()), float(first_vol.max())]
-        # Primary channel contrast for backward compat
-        self.contrast_limits = self.channel_contrast_limits[self.channels[0][1]]
+        self.contrast_limits = None
 
         # Two independent napari viewers — hidden until embedded in DualViewWindow
         self.viewer_left  = napari.Viewer(ndisplay=3, show=False)
@@ -1482,11 +1481,18 @@ class WormAnnotator:
         # Build the single main window (MIPAV's JFrame equivalent)
         self.dual_window = DualViewWindow(self.viewer_left, self.viewer_right, nav_widget)
 
-        # Connect annotation table edits (Seg column) to data model
+        # Connect annotation table edits (Seg column) and row selection
         for side in range(2):
             ann_table = self.dual_window.annotation_tables[side]
             ann_table.cellChanged.connect(
                 lambda row, col, s=side: self._on_annotation_table_edited(s, row, col))
+            ann_table.currentCellChanged.connect(
+                lambda row, col, prev_row, prev_col, s=side:
+                    self._on_annotation_row_selected(s, row))
+            lat_table = self.dual_window.lattice_tables[side]
+            lat_table.currentCellChanged.connect(
+                lambda row, col, prev_row, prev_col, s=side:
+                    self._on_lattice_row_selected(s, row, col))
 
         # Qt-level shortcuts on the host window so they fire regardless of which
         # child widget has keyboard focus (napari bind_key only fires when the
@@ -1565,25 +1571,67 @@ class WormAnnotator:
         return nav
 
     def _find_peak_multi_channel(self, near, far, side):
-        """Find peak along ray across all channels (MIPAV winner-take-all)."""
-        best_peak = None
-        best_val = -1
+        """Find peak along ray by blending all channels (MIPAV accurate mode).
+
+        MIPAV blends channels at each ray sample point, then finds one peak on
+        the combined signal. This avoids the problem of each channel finding a
+        peak at a different z-depth and the wrong channel winning.
+        """
         img_layers = self.grid_image_layers[side]
         if not isinstance(img_layers, list):
             img_layers = [img_layers]
-        for img_lyr in img_layers:
-            if img_lyr is None:
-                continue
-            vol = np.asarray(img_lyr.data)
-            peak = find_peak_along_ray(vol, near, far)
-            idx = np.clip(np.round(peak).astype(int), 0, np.array(vol.shape) - 1)
-            val = vol[tuple(idx)]
-            if val > best_val:
-                best_val = val
-                best_peak = peak
-        if best_peak is None:
+        layers = [l for l in img_layers if l is not None]
+        if not layers:
             return (near + far) / 2
-        return best_peak
+
+        # Sample ray positions (same for all channels)
+        n_samples = int(np.linalg.norm(far - near)) + 1
+        positions = np.linspace(near, far, n_samples)
+        from scipy.ndimage import map_coordinates
+        coords = positions.T  # (3, n_samples)
+
+        # Blend: sum normalized intensities across all visible channels
+        blended = np.zeros(n_samples)
+        for img_lyr in layers:
+            if not img_lyr.visible:
+                continue
+            vol = np.asarray(img_lyr.data).astype(np.float64)
+            vals = map_coordinates(vol, coords, order=1, mode='constant', cval=0.0)
+            # Normalize each channel to [0,1] by its contrast range so channels
+            # with different intensity ranges contribute equally
+            cmin, cmax = img_lyr.contrast_limits
+            if cmax > cmin:
+                vals = (vals - cmin) / (cmax - cmin)
+            blended += vals
+
+        if len(blended) == 0 or np.max(blended) == 0:
+            return (near + far) / 2
+        return positions[np.argmax(blended)]
+
+    def _get_blended_volume(self, side):
+        """Return a blended volume for centroid refinement (multi-channel aware).
+
+        Each visible channel is normalized by its contrast limits and summed,
+        so gradient_ascent and centroid operate on the combined signal.
+        """
+        img_layers = self.grid_image_layers[side]
+        if not isinstance(img_layers, list):
+            return np.asarray(img_layers.data).astype(np.float64)
+        blended = None
+        for img_lyr in img_layers:
+            if img_lyr is None or not img_lyr.visible:
+                continue
+            vol = np.asarray(img_lyr.data).astype(np.float64)
+            cmin, cmax = img_lyr.contrast_limits
+            if cmax > cmin:
+                vol = (vol - cmin) / (cmax - cmin)
+            if blended is None:
+                blended = vol
+            else:
+                blended += vol
+        if blended is None:
+            return np.asarray(img_layers[0].data).astype(np.float64)
+        return blended
 
     def _load_dual_pair(self, t_left: int, t_right: int):
         """Load two timepoints into their respective viewers."""
@@ -1613,6 +1661,12 @@ class WormAnnotator:
                     cmap = 'gray'
                     blending = 'translucent'
                     layer_name = f'Volume t={ti}'
+                # Initialize contrast limits lazily on first load
+                if ch_name not in self.channel_contrast_limits:
+                    self.channel_contrast_limits[ch_name] = [
+                        float(vol.min()), float(vol.max())]
+                    if self.contrast_limits is None:
+                        self.contrast_limits = self.channel_contrast_limits[ch_name]
                 clim = self.channel_contrast_limits[ch_name]
                 img = viewer_ref.add_image(
                     vol, name=layer_name, colormap=cmap,
@@ -1698,7 +1752,7 @@ class WormAnnotator:
                         return
                     peak = self._find_peak_multi_channel(near, far, side_idx)
                     pos = find_nucleus_centroid(
-                        np.asarray(img_ref.data), peak)
+                        self._get_blended_volume(side_idx), peak)
 
                     n_l = len(lat_l_ref.data)
                     n_r = len(lat_r_ref.data)
@@ -1926,6 +1980,51 @@ class WormAnnotator:
             item.setText("")
             self.dual_window.annotation_tables[side].blockSignals(False)
 
+    def _highlight_point(self, layer, index, default_color, default_size):
+        """Make one point stand out with a white edge ring and larger size."""
+        n = len(layer.data)
+        if n == 0 or index < 0 or index >= n:
+            return
+        sizes = np.full(n, float(default_size))
+        sizes[index] = default_size * 2.0
+        layer.size = sizes
+        edge_widths = np.zeros(n)
+        edge_widths[index] = 2.0
+        layer.edge_width = edge_widths
+        edge_colors = np.array(['transparent'] * n)
+        edge_colors[index] = 'white'
+        layer.edge_color = edge_colors
+
+    def _clear_highlight(self, layer, default_color, default_size):
+        """Reset all points to default appearance."""
+        if layer is None or len(layer.data) == 0:
+            return
+        layer.size = default_size
+        layer.edge_width = 0
+        layer.edge_color = 'transparent'
+
+    def _on_annotation_row_selected(self, side: int, row: int):
+        """Highlight the selected annotation point in the 3D viewer."""
+        pts_layer = self.grid_points_layers[side]
+        if pts_layer is None or row < 0 or row >= len(pts_layer.data):
+            return
+        self._highlight_point(pts_layer, row, 'yellow', 5)
+
+    def _on_lattice_row_selected(self, side: int, row: int, col: int):
+        """Highlight both L and R lattice points for the selected pair row."""
+        lat_l = self.lattice_left_layers[side]
+        lat_r = self.lattice_right_layers[side]
+        if row < 0:
+            return
+        # Clear previous highlights
+        self._clear_highlight(lat_l, 'cyan', 7)
+        self._clear_highlight(lat_r, 'magenta', 7)
+        # Highlight both L and R for the pair
+        if lat_l is not None and row < len(lat_l.data):
+            self._highlight_point(lat_l, row, 'cyan', 7)
+        if lat_r is not None and row < len(lat_r.data):
+            self._highlight_point(lat_r, row, 'magenta', 7)
+
     def _update_histograms(self):
         """Bind histogram widgets to image layers after loading a timepoint pair."""
         if self.multi_channel:
@@ -2008,7 +2107,7 @@ class WormAnnotator:
                 print("[lattice] ray missed volume — click closer to the worm")
                 return
             peak = self._find_peak_multi_channel(near, far, side_idx)
-            pos = find_nucleus_centroid(np.asarray(img_layer.data), peak)
+            pos = find_nucleus_centroid(self._get_blended_volume(side_idx), peak)
             canvas_label = "left" if side_idx == 0 else "right"
 
             is_seam = 'Shift' in event.modifiers
@@ -2284,7 +2383,7 @@ class WormAnnotator:
         if near is None or far is None:
             return
         peak = self._find_peak_multi_channel(near, far, side_idx)
-        pos = find_nucleus_centroid(np.asarray(layer.data), peak)
+        pos = find_nucleus_centroid(self._get_blended_volume(side_idx), peak)
         points_layer.add(pos)
         self.undo_stack.append((timepoint, points_layer))
         self.grid_annotation_segments.setdefault(timepoint, []).append(-1)
@@ -2490,10 +2589,10 @@ class WormAnnotator:
             show_info("Surface: OFF")
 
     def _on_lattice_done(self):
-        """Finalize the lattice — save and exit lattice mode."""
+        """Exit lattice mode (use S to save)."""
         if not self.lattice_mode:
             return
-        self._save_lattice()
+        self._save_annotations(self.viewer_left)
         self.lattice_mode = False
         self.lattice_last_placed = None
         print("=" * 50)
