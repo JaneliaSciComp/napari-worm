@@ -25,8 +25,9 @@ from dask import delayed
 from qtpy.QtCore import QEvent, QObject, Qt, QTimer
 from qtpy.QtGui import QKeySequence
 from qtpy.QtWidgets import (
-    QCheckBox, QHBoxLayout, QLabel, QShortcut, QSpinBox,
-    QSplitter, QVBoxLayout, QWidget,
+    QCheckBox, QHBoxLayout, QHeaderView, QLabel, QShortcut, QSpinBox,
+    QSplitter, QTabWidget, QTableWidget, QTableWidgetItem,
+    QVBoxLayout, QWidget,
 )
 import pyqtgraph as pg
 
@@ -1169,22 +1170,73 @@ class DualViewWindow:
         vbox.addWidget(nav_widget, stretch=0)
         self._host.setCentralWidget(central)
 
-        # Histogram LUT — injected directly into each viewer's dockLayerList
-        # widget (QVBoxLayout: QtLayerButtons, QtLayerList, QtViewerButtons).
-        # We insert the histogram before QtViewerButtons so the layout is:
-        #   LayerButtons → LayerList → HistogramLUT → ViewerButtons
-        # No extra dock widgets, no tabs — both layer list and histogram
-        # are always visible together.
+        # Per-viewer tab widgets inside dockLayerList:
+        #   Tab 0 "Layers": existing layer list + histogram (as before)
+        #   Tab 1 "Tables": annotation table + lattice table
         self.histogram_left = HistogramLUTWidget()
         self.histogram_right = HistogramLUTWidget()
-        for qt_viewer, hist_widget in [
+        self.annotation_tables: list[QTableWidget] = [None, None]
+        self.lattice_tables: list[QTableWidget] = [None, None]
+        self.tab_widgets: list[QTabWidget] = [None, None]
+
+        for side, (qt_viewer, hist_widget) in enumerate([
             (self._qt_left, self.histogram_left),
             (self._qt_right, self.histogram_right),
-        ]:
+        ]):
             dock_widget = qt_viewer.dockLayerList.widget()
-            layout = dock_widget.layout()
-            # Insert before the last item (QtViewerButtons)
-            layout.insertWidget(layout.count() - 1, hist_widget)
+            dock_layout = dock_widget.layout()
+
+            # --- "Layers" tab: reparent existing children + histogram ---
+            layers_tab = QWidget()
+            layers_layout = QVBoxLayout(layers_tab)
+            layers_layout.setContentsMargins(0, 0, 0, 0)
+            layers_layout.setSpacing(0)
+            while dock_layout.count():
+                item = dock_layout.takeAt(0)
+                w = item.widget()
+                if w:
+                    layers_layout.addWidget(w)
+            # Insert histogram before last widget (QtViewerButtons)
+            layers_layout.insertWidget(layers_layout.count() - 1, hist_widget)
+
+            # --- "Tables" tab: annotation + lattice tables ---
+            tables_tab = QWidget()
+            tables_layout = QVBoxLayout(tables_tab)
+            tables_layout.setContentsMargins(0, 0, 0, 0)
+            tables_layout.setSpacing(4)
+
+            ann_label = QLabel("Annotations")
+            ann_label.setStyleSheet("font-weight: bold; padding: 4px;")
+            tables_layout.addWidget(ann_label)
+            ann_table = QTableWidget(0, 4)
+            ann_table.setHorizontalHeaderLabels(["Name", "X", "Y", "Z"])
+            ann_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+            ann_table.setEditTriggers(QTableWidget.NoEditTriggers)
+            ann_table.setSelectionBehavior(QTableWidget.SelectRows)
+            ann_table.verticalHeader().setVisible(False)
+            tables_layout.addWidget(ann_table, stretch=1)
+
+            lat_label = QLabel("Lattice")
+            lat_label.setStyleSheet("font-weight: bold; padding: 4px;")
+            tables_layout.addWidget(lat_label)
+            lat_table = QTableWidget(0, 7)
+            lat_table.setHorizontalHeaderLabels(
+                ["Pair", "L_X", "L_Y", "L_Z", "R_X", "R_Y", "R_Z"])
+            lat_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+            lat_table.setEditTriggers(QTableWidget.NoEditTriggers)
+            lat_table.setSelectionBehavior(QTableWidget.SelectRows)
+            lat_table.verticalHeader().setVisible(False)
+            tables_layout.addWidget(lat_table, stretch=1)
+
+            # --- Assemble QTabWidget ---
+            tab_widget = QTabWidget()
+            tab_widget.addTab(layers_tab, "Layers")
+            tab_widget.addTab(tables_tab, "Tables")
+            dock_layout.addWidget(tab_widget)
+
+            self.annotation_tables[side] = ann_table
+            self.lattice_tables[side] = lat_table
+            self.tab_widgets[side] = tab_widget
 
         # Tabify right viewer's docks behind left viewer's docks.
         # raise_() to switch tabs is purely cosmetic — no layout recalculation,
@@ -1714,6 +1766,7 @@ class WormAnnotator:
                     entry['right'] = lat_r_ref.data.copy() if len(lat_r_ref.data) > 0 else np.empty((0, 3))
                     if dragged:
                         print(f"[t={timepoint}] Released {name}")
+                        self._refresh_tables()
 
                 return handler
 
@@ -1752,6 +1805,7 @@ class WormAnnotator:
         # Update histogram LUT widgets — bind to first channel's image layer,
         # or connect to active layer selection for multi-channel switching
         self._update_histograms()
+        self._refresh_tables()
 
     def _save_grid_annotations_to_cache(self):
         for side, pts in enumerate(self.grid_points_layers):
@@ -1771,6 +1825,59 @@ class WormAnnotator:
                 entry['left']  = lat_l.data.copy()
             if lat_r is not None and len(lat_r.data) > 0:
                 entry['right'] = lat_r.data.copy()
+
+    def _refresh_tables(self):
+        """Refresh both annotation and lattice tables for both sides."""
+        for side in range(2):
+            self._refresh_annotation_table(side)
+            self._refresh_lattice_table(side)
+
+    def _refresh_annotation_table(self, side: int):
+        """Populate annotation table from current points layer data."""
+        table = self.dual_window.annotation_tables[side]
+        if table is None:
+            return
+        pts_layer = self.grid_points_layers[side]
+        if pts_layer is None or len(pts_layer.data) == 0:
+            table.setRowCount(0)
+            return
+        data = np.asarray(pts_layer.data)
+        table.setRowCount(len(data))
+        for i, (z, y, x) in enumerate(data):
+            table.setItem(i, 0, QTableWidgetItem(f"A{i}"))
+            table.setItem(i, 1, QTableWidgetItem(f"{x:.1f}"))
+            table.setItem(i, 2, QTableWidgetItem(f"{y:.1f}"))
+            table.setItem(i, 3, QTableWidgetItem(f"{z:.1f}"))
+
+    def _refresh_lattice_table(self, side: int):
+        """Populate lattice table from current lattice layer data."""
+        table = self.dual_window.lattice_tables[side]
+        if table is None:
+            return
+        ti = self.grid_timepoints[side] if side < len(self.grid_timepoints) else None
+        lat_l = self.lattice_left_layers[side]
+        lat_r = self.lattice_right_layers[side]
+        if lat_l is None or (len(lat_l.data) == 0 and (lat_r is None or len(lat_r.data) == 0)):
+            table.setRowCount(0)
+            return
+        l_data = np.asarray(lat_l.data) if len(lat_l.data) > 0 else np.empty((0, 3))
+        r_data = np.asarray(lat_r.data) if lat_r is not None and len(lat_r.data) > 0 else np.empty((0, 3))
+        pair_names = self.lattice_pair_names.get(ti, []) if ti is not None else []
+        n_rows = max(len(l_data), len(r_data))
+        table.setRowCount(n_rows)
+        for i in range(n_rows):
+            name = pair_names[i]['name'] if i < len(pair_names) else f"a{i}"
+            table.setItem(i, 0, QTableWidgetItem(name))
+            if i < len(l_data):
+                z, y, x = l_data[i]
+                table.setItem(i, 1, QTableWidgetItem(f"{x:.1f}"))
+                table.setItem(i, 2, QTableWidgetItem(f"{y:.1f}"))
+                table.setItem(i, 3, QTableWidgetItem(f"{z:.1f}"))
+            if i < len(r_data):
+                z, y, x = r_data[i]
+                table.setItem(i, 4, QTableWidgetItem(f"{x:.1f}"))
+                table.setItem(i, 5, QTableWidgetItem(f"{y:.1f}"))
+                table.setItem(i, 6, QTableWidgetItem(f"{z:.1f}"))
 
     def _update_histograms(self):
         """Bind histogram widgets to image layers after loading a timepoint pair."""
@@ -1904,6 +2011,7 @@ class WormAnnotator:
             entry = self.lattice_annotations.setdefault(timepoint, {})
             entry['left']  = lat_left_layer.data.copy()  if len(lat_left_layer.data)  > 0 else np.empty((0, 3))
             entry['right'] = lat_right_layer.data.copy() if len(lat_right_layer.data) > 0 else np.empty((0, 3))
+            self._refresh_lattice_table(side_idx)
         except Exception as exc:
             import traceback
             traceback.print_exc()
@@ -1967,6 +2075,7 @@ class WormAnnotator:
             entry = self.lattice_annotations.setdefault(timepoint, {})
             entry['left']  = lat_left_layer.data.copy()
             entry['right'] = lat_right_layer.data.copy()
+            self._refresh_lattice_table(side_idx)
         except Exception as exc:
             import traceback
             traceback.print_exc()
@@ -2133,6 +2242,7 @@ class WormAnnotator:
         self.undo_stack.append((timepoint, points_layer))
         label = "left" if side_idx == 0 else "right"
         print(f"[t={timepoint} {label}] Added at z={pos[0]:.1f} y={pos[1]:.1f} x={pos[2]:.1f}")
+        self._refresh_annotation_table(side_idx)
 
     def _undo_last_point(self, viewer):
         if self.lattice_mode:
@@ -2158,6 +2268,8 @@ class WormAnnotator:
             print(f"[t={timepoint}] Undid last annotation (cached)")
         else:
             print(f"[t={timepoint}] Nothing to undo")
+            return
+        self._refresh_tables()
 
     def _undo_last_lattice_point(self):
         if not self.lattice_undo_stack:
@@ -2193,6 +2305,7 @@ class WormAnnotator:
             print(f"[t={timepoint}] Undid insertion at index {idx}")
             names_str = ', '.join(p['name'] for p in pair_names)
             print(f"  Renumbered: {names_str}")
+            self._refresh_tables()
             return
 
         layer = undo_entry[2]
@@ -2221,6 +2334,7 @@ class WormAnnotator:
                     self._update_lattice_visuals(ll, lr, llines, lmid, llc, lrc)
                     break
             print(f"[t={timepoint}] Undid last lattice {side_char} point")
+            self._refresh_tables()
         else:
             print(f"[t={timepoint}] Nothing to undo in lattice")
 
@@ -2275,6 +2389,7 @@ class WormAnnotator:
             if lat_r is layer:
                 entry['right'] = layer.data.copy()
                 break
+        self._refresh_tables()
 
     def _toggle_wireframe(self):
         """Toggle wireframe mesh visibility. Rebuilds mesh when turning on."""
