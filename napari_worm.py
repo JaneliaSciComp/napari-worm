@@ -197,8 +197,8 @@ def find_nucleus_centroid(data, seed, radius=7, threshold_fraction=0.5):
 # Annotation I/O
 # ---------------------------------------------------------------------------
 
-def save_annotations(points, filepath, names=None):
-    """Save annotations in MIPAV format: name,x_voxels,y_voxels,z_voxels,R,G,B"""
+def save_annotations(points, filepath, names=None, segments=None):
+    """Save annotations in MIPAV format: name,x_voxels,y_voxels,z_voxels,R,G,B[,lattice_segment]"""
     filepath = Path(filepath)
     n = len(points)
     if names is None:
@@ -210,6 +210,10 @@ def save_annotations(points, filepath, names=None):
         'z_voxels': points[:, 0],
         'R': 255, 'G': 255, 'B': 255,
     })
+    # Add lattice_segment column only if any annotation has a segment assigned
+    if segments is not None and any(s != -1 for s in segments):
+        seg_vals = list(segments) + [-1] * (n - len(segments))
+        df['lattice_segment'] = [s if s != -1 else '' for s in seg_vals[:n]]
     import time
     for attempt in range(3):
         try:
@@ -707,15 +711,19 @@ def load_annotations(filepath):
     if not filepath.exists():
         raise FileNotFoundError(f"Annotations not found: {filepath}")
     df = pd.read_csv(filepath)
+    segments = None
     if 'x_voxels' in df.columns:
         points = df[['z_voxels','y_voxels','x_voxels']].values
         names = df['name'].tolist() if 'name' in df.columns else None
+        if 'lattice_segment' in df.columns:
+            segments = [int(s) if str(s).strip() not in ('', 'nan') else -1
+                        for s in df['lattice_segment']]
         print(f"Loaded {len(points)} MIPAV annotations from {filepath}")
     else:
         points = df[['z','y','x']].values
         names = None
         print(f"Loaded {len(points)} annotations from {filepath}")
-    return points, names
+    return points, names, segments
 
 
 # ---------------------------------------------------------------------------
@@ -1208,10 +1216,11 @@ class DualViewWindow:
             ann_label = QLabel("Annotations")
             ann_label.setStyleSheet("font-weight: bold; padding: 4px;")
             tables_layout.addWidget(ann_label)
-            ann_table = QTableWidget(0, 4)
-            ann_table.setHorizontalHeaderLabels(["Name", "X", "Y", "Z"])
+            ann_table = QTableWidget(0, 5)
+            ann_table.setHorizontalHeaderLabels(["Name", "X", "Y", "Z", "Seg"])
             ann_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-            ann_table.setEditTriggers(QTableWidget.NoEditTriggers)
+            # Allow editing only on the Seg column (handled via delegate/flags)
+            ann_table.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.SelectedClicked)
             ann_table.setSelectionBehavior(QTableWidget.SelectRows)
             ann_table.verticalHeader().setVisible(False)
             tables_layout.addWidget(ann_table, stretch=1)
@@ -1319,7 +1328,7 @@ class WormAnnotator:
 
         self.cell_names = None
         if annotations_path and Path(annotations_path).exists():
-            points, names = load_annotations(annotations_path)
+            points, names, _segments = load_annotations(annotations_path)
             if not self.use_grid:
                 self.points_layer.data = points
             self.cell_names = names
@@ -1423,6 +1432,7 @@ class WormAnnotator:
         start = min(self.start_t, max_t - 1)
 
         self.grid_annotations: dict[int, np.ndarray] = {}
+        self.grid_annotation_segments: dict[int, list[int]] = {}  # parallel to grid_annotations, -1 = no lattice segment
         self.undo_stack: list[tuple[int, object]] = []
         # For multi-channel: grid_image_layers[side] is a list of image layers (one per channel)
         self.grid_image_layers: list = [None, None]
@@ -1471,6 +1481,12 @@ class WormAnnotator:
 
         # Build the single main window (MIPAV's JFrame equivalent)
         self.dual_window = DualViewWindow(self.viewer_left, self.viewer_right, nav_widget)
+
+        # Connect annotation table edits (Seg column) to data model
+        for side in range(2):
+            ann_table = self.dual_window.annotation_tables[side]
+            ann_table.cellChanged.connect(
+                lambda row, col, s=side: self._on_annotation_table_edited(s, row, col))
 
         # Qt-level shortcuts on the host window so they fire regardless of which
         # child widget has keyboard focus (napari bind_key only fires when the
@@ -1837,17 +1853,28 @@ class WormAnnotator:
         table = self.dual_window.annotation_tables[side]
         if table is None:
             return
+        # Block signals while rebuilding to avoid spurious cellChanged
+        table.blockSignals(True)
         pts_layer = self.grid_points_layers[side]
         if pts_layer is None or len(pts_layer.data) == 0:
             table.setRowCount(0)
+            table.blockSignals(False)
             return
+        ti = self.grid_timepoints[side]
         data = np.asarray(pts_layer.data)
+        segments = self.grid_annotation_segments.get(ti, [])
         table.setRowCount(len(data))
         for i, (z, y, x) in enumerate(data):
-            table.setItem(i, 0, QTableWidgetItem(f"A{i}"))
-            table.setItem(i, 1, QTableWidgetItem(f"{x:.1f}"))
-            table.setItem(i, 2, QTableWidgetItem(f"{y:.1f}"))
-            table.setItem(i, 3, QTableWidgetItem(f"{z:.1f}"))
+            # Name, X, Y, Z — read-only
+            for col, text in enumerate([f"A{i}", f"{x:.1f}", f"{y:.1f}", f"{z:.1f}"]):
+                item = QTableWidgetItem(text)
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                table.setItem(i, col, item)
+            # Seg — editable
+            seg_val = segments[i] if i < len(segments) else -1
+            seg_item = QTableWidgetItem("" if seg_val == -1 else str(seg_val))
+            table.setItem(i, 4, seg_item)
+        table.blockSignals(False)
 
     def _refresh_lattice_table(self, side: int):
         """Populate lattice table from current lattice layer data."""
@@ -1878,6 +1905,26 @@ class WormAnnotator:
                 table.setItem(i, 4, QTableWidgetItem(f"{x:.1f}"))
                 table.setItem(i, 5, QTableWidgetItem(f"{y:.1f}"))
                 table.setItem(i, 6, QTableWidgetItem(f"{z:.1f}"))
+
+    def _on_annotation_table_edited(self, side: int, row: int, col: int):
+        """Handle user editing the Seg column in the annotation table."""
+        if col != 4:  # only Seg column is editable
+            return
+        ti = self.grid_timepoints[side]
+        segments = self.grid_annotation_segments.setdefault(ti, [])
+        # Extend segments list if needed
+        while len(segments) <= row:
+            segments.append(-1)
+        item = self.dual_window.annotation_tables[side].item(row, 4)
+        text = item.text().strip() if item else ""
+        try:
+            segments[row] = int(text) if text else -1
+        except ValueError:
+            segments[row] = -1
+            # Reset the cell to blank on invalid input
+            self.dual_window.annotation_tables[side].blockSignals(True)
+            item.setText("")
+            self.dual_window.annotation_tables[side].blockSignals(False)
 
     def _update_histograms(self):
         """Bind histogram widgets to image layers after loading a timepoint pair."""
@@ -2240,6 +2287,7 @@ class WormAnnotator:
         pos = find_nucleus_centroid(np.asarray(layer.data), peak)
         points_layer.add(pos)
         self.undo_stack.append((timepoint, points_layer))
+        self.grid_annotation_segments.setdefault(timepoint, []).append(-1)
         label = "left" if side_idx == 0 else "right"
         print(f"[t={timepoint} {label}] Added at z={pos[0]:.1f} y={pos[1]:.1f} x={pos[2]:.1f}")
         self._refresh_annotation_table(side_idx)
@@ -2255,9 +2303,15 @@ class WormAnnotator:
         active = [p for p in self.grid_points_layers if p is not None]
         if any(p is pts for p in active) and len(pts.data) > 0:
             pts.data = pts.data[:-1]
+            segs = self.grid_annotation_segments.get(timepoint, [])
+            if segs:
+                segs.pop()
             print(f"[t={timepoint}] Undid last annotation")
         elif timepoint in self.grid_annotations and len(self.grid_annotations[timepoint]) > 0:
             self.grid_annotations[timepoint] = self.grid_annotations[timepoint][:-1]
+            segs = self.grid_annotation_segments.get(timepoint, [])
+            if segs:
+                segs.pop()
             for side, ti in enumerate(self.grid_timepoints):
                 if ti == timepoint and side < len(self.grid_points_layers):
                     dp = self.grid_points_layers[side]
@@ -2467,7 +2521,8 @@ class WormAnnotator:
                            / "integrated_annotation")
                 ann_dir.mkdir(parents=True, exist_ok=True)
                 save_path = ann_dir / "annotations_test.csv"
-                save_annotations(pts, save_path)
+                segs = self.grid_annotation_segments.get(ti, [])
+                save_annotations(pts, save_path, segments=segs)
                 total += len(pts)
                 ann_paths.append(str(save_path))
                 print(f"  Saved {len(pts)} to {save_path}")
