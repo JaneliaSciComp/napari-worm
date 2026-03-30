@@ -10,8 +10,10 @@ Developed at the **Shroff Lab**, Janelia Research Campus.
 
 - **3D click-to-annotate**: Cmd+Click places markers at peak intensity along the camera ray (gradient ascent + intensity-weighted centroid for sub-voxel accuracy)
 - **MIPAV-style dual view**: Two consecutive timepoints side-by-side with independent 3D canvases and linked navigation
-- **Multi-channel support**: Auto-discovers RegA/RegB (or wavelength 405/488/561/637) channels and overlays them with additive blending (red + green). Per-channel histogram/contrast controls. Peak detection uses winner-take-all across all channels, matching MIPAV's hyperstack behavior.
+- **Multi-channel support**: Auto-discovers RegA/RegB (or wavelength 405/488/561/637) channels and overlays them with additive blending (red + green). Per-channel histogram/contrast controls. Peak detection blends all visible channels (normalized by contrast limits) for accurate cross-channel placement, matching MIPAV's accurate mode.
+- **Trilinear ray sampling**: Ray-volume intersection uses trilinear interpolation (`scipy.ndimage.map_coordinates`) instead of nearest-voxel, matching MIPAV's `getFloatTriLinearBounds` accurate mode.
 - **Histogram + contrast controls**: MIPAV-style transfer function widget with 4 draggable control points, log scale, and per-channel colormap-aware display
+- **Annotation tables**: Layers/Tables tab widget with live annotation table (Name, X, Y, Z, Intensity, Seg) and lattice table (Pair, L/R coords). Inline coordinate editing updates 3D view live. Click row to highlight point. DELETE key removes points. Lattice segment column for associating annotations with lattice pairs. All operations undoable.
 - **Lattice mode**: Build left/right lattice pairs (nose-to-tail), with smooth natural cubic spline curves matching MIPAV's `NaturalSpline3(BT_FREE)`
 - **Seam cells**: Cmd+Shift+Click to mark seam cells (H0, H1, H2, V1-V6, T) with automatic MIPAV-compatible naming
 - **Insert / drag / nudge**: Click on curves to insert pairs, drag points to reposition, arrow keys to nudge by 1 voxel
@@ -66,7 +68,8 @@ pixi run python napari_worm.py /path/to/RegB/ --no-grid
 | `W` | Toggle wireframe mesh |
 | `Shift+W` | Toggle surface mesh |
 | `D` | Done with lattice (save + exit lattice mode) |
-| `S` / `Cmd+S` | Save annotations + lattice |
+| `S` / `Cmd+S` | Save all (annotations + lattice) |
+| `Delete` / `Backspace` | Remove selected row in table |
 | `Right` / `]` | Next timepoint pair |
 | `Left` / `[` | Previous timepoint pair |
 | `Cmd+Z` | Undo last annotation or lattice point |
@@ -74,7 +77,7 @@ pixi run python napari_worm.py /path/to/RegB/ --no-grid
 
 ## Output Format
 
-Annotations and lattice data are saved per-timepoint in MIPAV-compatible CSV format (`name,x_voxels,y_voxels,z_voxels,R,G,B`):
+Annotations and lattice data are saved per-timepoint in MIPAV-compatible CSV format (`name,x_voxels,y_voxels,z_voxels,R,G,B[,lattice_segment]`):
 
 ```
 RegB/Decon_reg_100/Decon_reg_100_results/integrated_annotation/annotations_test.csv
