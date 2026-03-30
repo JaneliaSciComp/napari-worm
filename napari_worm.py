@@ -206,6 +206,8 @@ def save_annotations(points, filepath, names=None, segments=None):
     n = len(points)
     if names is None:
         names = [f"A{i}" for i in range(n)]
+    elif len(names) < n:
+        names = list(names) + [f"A{i}" for i in range(len(names), n)]
     df = pd.DataFrame({
         'name':     names,
         'x_voxels': points[:, 2],
@@ -218,15 +220,14 @@ def save_annotations(points, filepath, names=None, segments=None):
         seg_vals = list(segments) + [-1] * (n - len(segments))
         df['lattice_segment'] = [s if s != -1 else '' for s in seg_vals[:n]]
     import time
-    for attempt in range(3):
+    for attempt in range(5):
         try:
             df.to_csv(filepath, index=False)
-            return
+            return True
         except BlockingIOError:
-            if attempt < 2:
-                time.sleep(0.5)
-            else:
-                print(f"  WARNING: could not write {filepath} (network drive busy)")
+            time.sleep(1.0)
+    print(f"  WARNING: could not write {filepath} (network drive busy after 5 retries)")
+    return False
 
 
 def _lattice_pair_name(pair_idx: int) -> str:
@@ -765,6 +766,25 @@ class _ArrowKeyFilter(QObject):
         return False  # pass other events through
 
 
+class _TableDeleteFilter(QObject):
+    """Intercept Delete/Backspace key on table widgets to remove selected row."""
+    def __init__(self, annotator, side: int, table_type: str):
+        super().__init__()
+        self._ann = annotator
+        self._side = side
+        self._type = table_type  # 'annotation' or 'lattice'
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.KeyPress and event.key() in (
+                Qt.Key_Delete, Qt.Key_Backspace):
+            if self._type == 'annotation':
+                self._ann._delete_annotation_row(self._side)
+            else:
+                self._ann._delete_lattice_row(self._side)
+            return True
+        return False
+
+
 class _CanvasClickFilter(QObject):
     """Switch the active control panel when a canvas receives a mouse click.
 
@@ -1222,8 +1242,8 @@ class DualViewWindow:
             ann_label = QLabel("Annotations")
             ann_label.setStyleSheet("font-weight: bold; padding: 4px;")
             tables_layout.addWidget(ann_label)
-            ann_table = QTableWidget(0, 5)
-            ann_table.setHorizontalHeaderLabels(["Name", "X", "Y", "Z", "Seg"])
+            ann_table = QTableWidget(0, 6)
+            ann_table.setHorizontalHeaderLabels(["Name", "X", "Y", "Z", "Intensity", "Seg"])
             ann_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
             # Allow editing only on the Seg column (handled via delegate/flags)
             ann_table.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.SelectedClicked)
@@ -1513,6 +1533,15 @@ class WormAnnotator:
             lat_table.currentCellChanged.connect(
                 lambda row, col, prev_row, prev_col, s=side:
                     self._on_lattice_row_selected(s, row, col))
+            # Delete key on tables
+            ann_del = _TableDeleteFilter(self, side, 'annotation')
+            ann_table.installEventFilter(ann_del)
+            lat_del = _TableDeleteFilter(self, side, 'lattice')
+            lat_table.installEventFilter(lat_del)
+            # Keep references so they aren't garbage collected
+            if not hasattr(self, '_table_filters'):
+                self._table_filters = []
+            self._table_filters.extend([ann_del, lat_del])
 
         # Qt-level shortcuts on the host window so they fire regardless of which
         # child widget has keyboard focus (napari bind_key only fires when the
@@ -1938,6 +1967,15 @@ class WormAnnotator:
         data = np.asarray(pts_layer.data)
         segments = self.grid_annotation_segments.get(ti, [])
         table.setRowCount(len(data))
+        # Get raw volume for intensity lookup (first image layer)
+        img_layers = self.grid_image_layers[side]
+        if isinstance(img_layers, list):
+            raw_vol = np.asarray(img_layers[0].data)
+        elif img_layers is not None:
+            raw_vol = np.asarray(img_layers.data)
+        else:
+            raw_vol = None
+        vol_shape = np.array(raw_vol.shape) if raw_vol is not None else None
         for i, (z, y, x) in enumerate(data):
             # Name — read-only
             name_item = QTableWidgetItem(f"A{i}")
@@ -1947,9 +1985,18 @@ class WormAnnotator:
             table.setItem(i, 1, QTableWidgetItem(f"{x:.1f}"))
             table.setItem(i, 2, QTableWidgetItem(f"{y:.1f}"))
             table.setItem(i, 3, QTableWidgetItem(f"{z:.1f}"))
-            # Seg — editable
+            # Intensity — read-only, raw value from primary channel
+            if raw_vol is not None:
+                idx = np.clip(np.round([z, y, x]).astype(int), 0, vol_shape - 1)
+                val = int(raw_vol[tuple(idx)])
+            else:
+                val = 0
+            val_item = QTableWidgetItem(str(val))
+            val_item.setFlags(val_item.flags() & ~Qt.ItemIsEditable)
+            table.setItem(i, 4, val_item)
+            # Seg — editable (now column 5)
             seg_val = segments[i] if i < len(segments) else -1
-            table.setItem(i, 4, QTableWidgetItem("" if seg_val == -1 else str(seg_val)))
+            table.setItem(i, 5, QTableWidgetItem("" if seg_val == -1 else str(seg_val)))
         table.blockSignals(False)
 
     def _refresh_lattice_table(self, side: int):
@@ -1992,7 +2039,7 @@ class WormAnnotator:
 
     def _on_annotation_table_edited(self, side: int, row: int, col: int):
         """Handle user editing X/Y/Z or Seg columns in the annotation table."""
-        if col == 0:  # Name is read-only
+        if col in (0, 4):  # Name and Intensity are read-only
             return
         table = self.dual_window.annotation_tables[side]
         item = table.item(row, col)
@@ -2000,7 +2047,7 @@ class WormAnnotator:
             return
         text = item.text().strip()
 
-        if col == 4:  # Seg column
+        if col == 5:  # Seg column
             ti = self.grid_timepoints[side]
             segments = self.grid_annotation_segments.setdefault(ti, [])
             while len(segments) <= row:
@@ -2084,6 +2131,68 @@ class WormAnnotator:
             entry['left'] = lat_l.data.copy()
         if lat_r is not None and len(lat_r.data) > 0:
             entry['right'] = lat_r.data.copy()
+
+    def _delete_annotation_row(self, side: int):
+        """Delete the selected annotation row."""
+        table = self.dual_window.annotation_tables[side]
+        row = table.currentRow()
+        pts_layer = self.grid_points_layers[side]
+        if row < 0 or pts_layer is None or row >= len(pts_layer.data):
+            return
+        ti = self.grid_timepoints[side]
+        old_data = pts_layer.data.copy()
+        pts_layer.data = np.delete(old_data, row, axis=0)
+        # Remove segment
+        segs = self.grid_annotation_segments.get(ti, [])
+        if row < len(segs):
+            segs.pop(row)
+        # Push undo
+        self.undo_stack.append(('DELETE_ANN', ti, side, row, old_data[row].copy()))
+        print(f"[t={ti}] Deleted annotation A{row}")
+        self._refresh_annotation_table(side)
+
+    def _delete_lattice_row(self, side: int):
+        """Delete the selected lattice pair (both L and R)."""
+        table = self.dual_window.lattice_tables[side]
+        row = table.currentRow()
+        lat_l = self.lattice_left_layers[side]
+        lat_r = self.lattice_right_layers[side]
+        if row < 0 or lat_l is None:
+            return
+        ti = self.grid_timepoints[side]
+        old_l = lat_l.data.copy() if len(lat_l.data) > 0 else np.empty((0, 3))
+        old_r = lat_r.data.copy() if lat_r is not None and len(lat_r.data) > 0 else np.empty((0, 3))
+        if row < len(old_l):
+            lat_l.data = np.delete(old_l, row, axis=0) if len(old_l) > 1 else np.empty((0, 3))
+        if row < len(old_r):
+            lat_r.data = np.delete(old_r, row, axis=0) if len(old_r) > 1 else np.empty((0, 3))
+        # Remove pair name and renumber
+        pair_names = self.lattice_pair_names.get(ti, [])
+        removed_name = None
+        if row < len(pair_names):
+            removed_name = pair_names.pop(row)
+            _renumber_lattice_pairs(pair_names)
+            self.lattice_seam_counter[ti] = [
+                p['name'] for p in pair_names if p['type'] == 'seam']
+        # Update visuals and cache
+        for ll, lr, llines, lmid, llc, lrc in zip(
+                self.lattice_left_layers, self.lattice_right_layers,
+                self.lattice_line_layers, self.lattice_mid_layers,
+                self.lattice_left_curve_layers, self.lattice_right_curve_layers):
+            if ll is lat_l:
+                self._update_lattice_visuals(ll, lr, llines, lmid, llc, lrc)
+                break
+        entry = self.lattice_annotations.setdefault(ti, {})
+        entry['left'] = lat_l.data.copy() if len(lat_l.data) > 0 else np.empty((0, 3))
+        entry['right'] = lat_r.data.copy() if lat_r is not None and len(lat_r.data) > 0 else np.empty((0, 3))
+        self.lattice_last_placed = None
+        # Push undo
+        old_l_pt = old_l[row].copy() if row < len(old_l) else None
+        old_r_pt = old_r[row].copy() if row < len(old_r) else None
+        self.lattice_undo_stack.append(('DELETE_LAT', ti, (row, old_l_pt, old_r_pt, removed_name)))
+        name = removed_name['name'] if removed_name else f"a{row}"
+        print(f"[t={ti}] Deleted lattice pair {name}")
+        self._refresh_tables()
 
     def _highlight_point(self, layer, index, default_color, default_size):
         """Make one point stand out with a white edge ring and larger size."""
@@ -2506,7 +2615,7 @@ class WormAnnotator:
         entry = self.undo_stack.pop()
 
         # Handle table coordinate edit undo
-        if isinstance(entry, tuple) and len(entry) == 5 and entry[0] == 'TABLE_ANN':
+        if isinstance(entry, tuple) and len(entry) >= 4 and entry[0] == 'TABLE_ANN':
             _, ti, side, row, old_val = entry
             pts_layer = self.grid_points_layers[side]
             if pts_layer is not None and row < len(pts_layer.data):
@@ -2514,6 +2623,19 @@ class WormAnnotator:
                 pts[row] = old_val
                 pts_layer.data = pts
                 print(f"[t={ti}] Undid table edit on A{row}")
+                self._refresh_tables()
+            return
+
+        # Handle delete annotation undo — re-insert the deleted point
+        if isinstance(entry, tuple) and len(entry) >= 4 and entry[0] == 'DELETE_ANN':
+            _, ti, side, row, old_val = entry
+            pts_layer = self.grid_points_layers[side]
+            if pts_layer is not None:
+                pts = pts_layer.data.copy() if len(pts_layer.data) > 0 else np.empty((0, 3))
+                pts_layer.data = np.insert(pts, row, old_val, axis=0)
+                segs = self.grid_annotation_segments.setdefault(ti, [])
+                segs.insert(row, -1)
+                print(f"[t={ti}] Undid delete of A{row}")
                 self._refresh_tables()
             return
 
@@ -2550,6 +2672,41 @@ class WormAnnotator:
         undo_entry = self.lattice_undo_stack.pop()
         side_char = undo_entry[0]
         timepoint = undo_entry[1]
+
+        if side_char == 'DELETE_LAT':
+            # Undo a lattice pair deletion — re-insert
+            row, old_l_pt, old_r_pt, removed_name = undo_entry[2]
+            # Find the side that has this timepoint
+            for side in range(2):
+                if side < len(self.grid_timepoints) and self.grid_timepoints[side] == timepoint:
+                    lat_l = self.lattice_left_layers[side]
+                    lat_r = self.lattice_right_layers[side]
+                    if lat_l is not None and old_l_pt is not None:
+                        l_data = lat_l.data.copy() if len(lat_l.data) > 0 else np.empty((0, 3))
+                        lat_l.data = np.insert(l_data, row, old_l_pt, axis=0)
+                    if lat_r is not None and old_r_pt is not None:
+                        r_data = lat_r.data.copy() if len(lat_r.data) > 0 else np.empty((0, 3))
+                        lat_r.data = np.insert(r_data, row, old_r_pt, axis=0)
+                    pair_names = self.lattice_pair_names.setdefault(timepoint, [])
+                    if removed_name is not None:
+                        pair_names.insert(row, removed_name)
+                        _renumber_lattice_pairs(pair_names)
+                        self.lattice_seam_counter[timepoint] = [
+                            p['name'] for p in pair_names if p['type'] == 'seam']
+                    for ll, lr, llines, lmid, llc, lrc in zip(
+                            self.lattice_left_layers, self.lattice_right_layers,
+                            self.lattice_line_layers, self.lattice_mid_layers,
+                            self.lattice_left_curve_layers, self.lattice_right_curve_layers):
+                        if ll is lat_l:
+                            self._update_lattice_visuals(ll, lr, llines, lmid, llc, lrc)
+                            break
+                    entry = self.lattice_annotations.setdefault(timepoint, {})
+                    entry['left'] = lat_l.data.copy() if len(lat_l.data) > 0 else np.empty((0, 3))
+                    entry['right'] = lat_r.data.copy() if lat_r is not None and len(lat_r.data) > 0 else np.empty((0, 3))
+                    break
+            print(f"[t={timepoint}] Undid delete of lattice pair at index {row}")
+            self._refresh_tables()
+            return
 
         if side_char == 'TABLE_LAT':
             # Undo a lattice table coordinate edit
@@ -2767,10 +2924,10 @@ class WormAnnotator:
                 ann_dir.mkdir(parents=True, exist_ok=True)
                 save_path = ann_dir / "annotations_test.csv"
                 segs = self.grid_annotation_segments.get(ti, [])
-                save_annotations(pts, save_path, segments=segs)
-                total += len(pts)
-                ann_paths.append(str(save_path))
-                print(f"  Saved {len(pts)} to {save_path}")
+                if save_annotations(pts, save_path, segments=segs):
+                    total += len(pts)
+                    ann_paths.append(str(save_path))
+                    print(f"  Saved {len(pts)} to {save_path}")
             msg = f"Saved {total} annotations across {len(self.grid_annotations)} timepoint(s):\n" + "\n".join(ann_paths)
             print(msg)
             show_info(msg)
