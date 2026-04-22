@@ -1260,8 +1260,8 @@ class DualViewWindow:
                 w = item.widget()
                 if w:
                     layers_layout.addWidget(w)
-            # Insert histogram before last widget (QtViewerButtons)
-            layers_layout.insertWidget(layers_layout.count() - 1, hist_widget)
+            # Insert histogram at the top of the Layers tab
+            layers_layout.insertWidget(0, hist_widget)
 
             # --- "Tables" tab: annotation + lattice tables ---
             tables_tab = QWidget()
