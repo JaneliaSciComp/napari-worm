@@ -27,8 +27,8 @@ from qtpy.QtCore import QEvent, QObject, Qt, QTimer
 from qtpy.QtGui import QKeySequence
 from qtpy.QtWidgets import (
     QApplication, QCheckBox, QFileDialog, QHBoxLayout, QHeaderView, QLabel,
-    QMessageBox, QPushButton, QShortcut, QSpinBox, QSplitter, QTabWidget,
-    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QMessageBox, QPushButton, QShortcut, QSlider, QSpinBox, QSplitter,
+    QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 import pyqtgraph as pg
 
@@ -1250,14 +1250,37 @@ class DualViewWindow:
             dock_widget = qt_viewer.dockLayerList.widget()
             dock_layout = dock_widget.layout()
 
-            # --- Add histogram below layer controls ---
+            # --- Add histogram + threshold below layer controls ---
             controls_widget = qt_viewer.dockLayerControls.widget()
             container = QWidget()
             container_layout = QVBoxLayout(container)
             container_layout.setContentsMargins(0, 0, 0, 0)
             container_layout.setSpacing(0)
             container_layout.addWidget(controls_widget)
+
+            # Threshold slider: single row — label + slider + value
+            from superqt import QLabeledDoubleSlider
+            thresh_row = QHBoxLayout()
+            thresh_row.setContentsMargins(8, 2, 8, 2)
+            thresh_lbl = QLabel("threshold:")
+            thresh_lbl.setFixedWidth(62)
+            thresh_row.addWidget(thresh_lbl)
+            thresh_slider = QLabeledDoubleSlider(Qt.Horizontal)
+            thresh_slider.setRange(0, 65535)
+            thresh_slider.setValue(0)
+            thresh_slider.setToolTip(
+                "Minimum intensity threshold — voxels below this value\n"
+                "appear dark on both viewers")
+            thresh_slider.valueChanged.connect(
+                lambda v: self._annotator._apply_threshold(int(v)))
+            thresh_row.addWidget(thresh_slider)
+            container_layout.addLayout(thresh_row)
             container_layout.addWidget(hist_widget)
+
+            if not hasattr(self, '_thresh_sliders'):
+                self._thresh_sliders = [None, None]
+            self._thresh_sliders[side] = thresh_slider
+
             qt_viewer.dockLayerControls.setWidget(container)
 
             # --- "Layers" tab: reparent existing children ---
@@ -1731,6 +1754,8 @@ class WormAnnotator:
 <li>Click a row in the Tables tab to highlight that point in 3D</li>
 <li>Edit X/Y/Z coordinates directly in the table (double-click)</li>
 <li>Multi-channel: RegA (red) + RegB (green) auto-discovered from sibling folders</li>
+<li><b>Threshold slider</b> (below layer controls): filters dim voxels on both viewers</li>
+<li><b>Contrast limits</b>: adjusts the selected layer/channel only</li>
 </ul>
 """)
         layout.addWidget(text)
@@ -2043,6 +2068,37 @@ class WormAnnotator:
         # or connect to active layer selection for multi-channel switching
         self._update_histograms()
         self._refresh_tables()
+
+        # Auto-select the first image layer so layer controls default to volume
+        # (otherwise a Shapes layer like Wireframe is selected and controls
+        # for opacity/blending don't visually affect the volume)
+        img_layers = self.grid_image_layers[0]
+        if img_layers:
+            first_img = img_layers[0] if isinstance(img_layers, list) else img_layers
+            self.viewer_left.layers.selection.active = first_img
+
+    def _apply_threshold(self, tmin: int):
+        """Set lower contrast limit on all image layers (hides dim voxels).
+
+        Uses contrast_limits rather than zeroing data, so it's non-destructive
+        and works with the histogram transfer function.
+        """
+        for side in range(2):
+            img_layers = self.grid_image_layers[side]
+            if img_layers is None:
+                continue
+            if not isinstance(img_layers, list):
+                img_layers = [img_layers]
+            for img in img_layers:
+                cmax = img.contrast_limits[1]
+                img.contrast_limits = (tmin, cmax)
+        # Sync both sliders
+        for sl in self.dual_window._thresh_sliders:
+            if sl is not None:
+                sl.blockSignals(True)
+                sl.setValue(tmin)
+                sl.blockSignals(False)
+        pass  # no print/notification — slider fires continuously
 
     def _save_grid_annotations_to_cache(self):
         for side, pts in enumerate(self.grid_points_layers):
