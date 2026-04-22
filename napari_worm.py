@@ -2,6 +2,7 @@
 napari_worm: 3D Cell Annotation Tool for C. elegans
 
 Usage:
+    python napari_worm.py                                         # opens directory picker dialog
     python napari_worm.py /path/to/volume.tif                    # single file
     python napari_worm.py /path/to/directory/                     # dual view (MIPAV-style)
     python napari_worm.py /path/to/directory/ --start 100         # start at timepoint 100
@@ -25,9 +26,9 @@ from dask import delayed
 from qtpy.QtCore import QEvent, QObject, Qt, QTimer
 from qtpy.QtGui import QKeySequence
 from qtpy.QtWidgets import (
-    QCheckBox, QHBoxLayout, QHeaderView, QLabel, QShortcut, QSpinBox,
-    QSplitter, QTabWidget, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QFileDialog, QHBoxLayout, QHeaderView, QLabel,
+    QShortcut, QSpinBox, QSplitter, QTabWidget, QTableWidget,
+    QTableWidgetItem, QVBoxLayout, QWidget,
 )
 import pyqtgraph as pg
 
@@ -733,6 +734,35 @@ def load_annotations(filepath):
 # ---------------------------------------------------------------------------
 # MIPAV-style dual-view window
 # ---------------------------------------------------------------------------
+
+class _CommitOnEnterSpinBox(QSpinBox):
+    """SpinBox that fires immediately on arrow clicks but waits for Enter when typing.
+
+    - Arrow buttons / keyboard arrows: ``committed`` emitted on every step
+    - Typing digits: ``committed`` emitted only on Enter or focus-out
+    """
+    from qtpy.QtCore import Signal
+    committed = Signal()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._typing = False
+        self.lineEdit().textEdited.connect(self._on_text_edited)
+        self.valueChanged.connect(self._on_value_changed)
+        self.editingFinished.connect(self._on_editing_finished)
+
+    def _on_text_edited(self, _text):
+        self._typing = True
+
+    def _on_value_changed(self, _val):
+        if not self._typing:
+            self.committed.emit()
+
+    def _on_editing_finished(self):
+        if self._typing:
+            self._typing = False
+            self.committed.emit()
+
 
 class _ArrowKeyFilter(QObject):
     """Intercept arrow keys before napari's canvas to enable lattice nudging.
@@ -1580,7 +1610,6 @@ class WormAnnotator:
         # vispy creates visuals without a valid context and the event→repaint
         # pipeline is broken (controls don't visually update the canvas).
         self.dual_window.showMaximized()
-        from qtpy.QtWidgets import QApplication
         QApplication.processEvents()   # flush Qt events → GL context ready
 
         # Set left dock area to 370 px so control labels are fully visible
@@ -1600,20 +1629,20 @@ class WormAnnotator:
 
         layout.addStretch()
         layout.addWidget(QLabel("Left t="))
-        self._left_spin = QSpinBox()
+        self._left_spin = _CommitOnEnterSpinBox()
         self._left_spin.setRange(0, max_t)
         self._left_spin.setValue(start)
         self._left_spin.setFixedWidth(80)
-        self._left_spin.valueChanged.connect(self._on_spinbox_changed)
+        self._left_spin.committed.connect(self._on_spinbox_changed)
         layout.addWidget(self._left_spin)
 
         layout.addStretch()
         layout.addWidget(QLabel("Right t="))
-        self._right_spin = QSpinBox()
+        self._right_spin = _CommitOnEnterSpinBox()
         self._right_spin.setRange(0, max_t)
         self._right_spin.setValue(min(start + 1, max_t))
         self._right_spin.setFixedWidth(80)
-        self._right_spin.valueChanged.connect(self._on_spinbox_changed)
+        self._right_spin.committed.connect(self._on_spinbox_changed)
         layout.addWidget(self._right_spin)
 
         layout.addStretch()
@@ -2572,10 +2601,14 @@ class WormAnnotator:
             print(msg)
             show_info(msg)
 
-    def _on_spinbox_changed(self, _):
+    def _on_spinbox_changed(self):
         if self._nav_updating:
             return
-        self._load_dual_pair(self._left_spin.value(), self._right_spin.value())
+        new_left, new_right = self._left_spin.value(), self._right_spin.value()
+        # Skip if timepoints haven't actually changed
+        if (new_left, new_right) == self.grid_timepoints:
+            return
+        self._load_dual_pair(new_left, new_right)
 
     def _grid_next(self, viewer):
         t_left, t_right = self.grid_timepoints
@@ -2953,7 +2986,9 @@ class WormAnnotator:
 def main():
     parser = argparse.ArgumentParser(
         description="napari_worm: 3D Cell Annotation Tool for C. elegans")
-    parser.add_argument("volume", help="TIFF file or directory of TIFFs")
+    parser.add_argument("volume", nargs="?", default=None,
+                        help="TIFF file or directory of TIFFs "
+                             "(opens file dialog if omitted)")
     parser.add_argument("--annotations", "-a", default=None,
                         help="Existing annotations CSV (optional)")
     parser.add_argument("--no-grid", action="store_true",
@@ -2965,7 +3000,83 @@ def main():
                              "Auto-discovered if omitted.")
     args = parser.parse_args()
 
-    WormAnnotator(args.volume, args.annotations,
+    volume = args.volume
+    if volume is None:
+        # No path on command line — show a GUI dialog for path selection
+        import json
+        app = QApplication.instance() or QApplication([])
+
+        # Load last-used path from settings file
+        settings_file = Path.home() / ".napari_worm_settings.json"
+        last_dir = ""
+        if settings_file.exists():
+            try:
+                last_dir = json.loads(settings_file.read_text()).get("last_dir", "")
+            except Exception:
+                pass
+
+        # Build a small dialog with path text field + Browse button
+        from qtpy.QtWidgets import (QDialog, QDialogButtonBox, QLineEdit,
+                                     QPushButton)
+        dlg = QDialog()
+        dlg.setWindowTitle("napari-worm — Select Volume Directory")
+        dlg.setMinimumWidth(600)
+        layout = QVBoxLayout(dlg)
+
+        layout.addWidget(QLabel("Enter or browse to a volume directory (folder of TIFFs):"))
+        path_row = QHBoxLayout()
+        path_edit = QLineEdit(last_dir)
+        path_edit.setPlaceholderText("/path/to/RegB  or  /Volumes/shroff/.../For_Tracking/RegB")
+        browse_btn = QPushButton("Browse...")
+        path_row.addWidget(path_edit)
+        path_row.addWidget(browse_btn)
+        layout.addLayout(path_row)
+
+        def _browse():
+            start = path_edit.text() or last_dir or "/Volumes"
+            d = QFileDialog.getExistingDirectory(dlg, "Select directory", start,
+                                                  QFileDialog.ShowDirsOnly)
+            if d:
+                path_edit.setText(d)
+
+        browse_btn.clicked.connect(_browse)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+
+        # Accept on Enter in the text field
+        path_edit.returnPressed.connect(dlg.accept)
+
+        if not dlg.exec():
+            print("No directory selected — exiting.")
+            return
+        volume = path_edit.text().strip()
+        if not volume:
+            print("No directory selected — exiting.")
+            return
+
+        # Save the selected path for next time
+        try:
+            settings_file.write_text(json.dumps({"last_dir": volume}))
+        except Exception:
+            pass
+
+    # If the selected directory has no TIFFs but contains Reg* subdirectories,
+    # auto-resolve to the first channel dir (e.g. For_Tracking/ → RegB/)
+    vp = Path(volume)
+    if vp.is_dir() and not list(vp.glob("*.tif"))[:1]:
+        reg_dirs = sorted([
+            d for d in vp.iterdir()
+            if d.is_dir() and d.name.startswith('Reg') and list(d.glob("*.tif"))[:1]
+        ], key=lambda d: d.name)
+        if reg_dirs:
+            volume = str(reg_dirs[-1])  # prefer RegB (last alphabetically)
+            print(f"No TIFFs in selected directory — using {reg_dirs[-1].name}/")
+            print(f"  (sibling channels will be auto-discovered)")
+
+    WormAnnotator(volume, args.annotations,
                   grid_mode=not args.no_grid, start_t=args.start,
                   channels=args.channels).run()
 
