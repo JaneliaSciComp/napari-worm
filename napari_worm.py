@@ -1853,11 +1853,11 @@ class WormAnnotator:
                 if self.multi_channel:
                     cmap = ch_cmap
                     blending = 'additive'
-                    layer_name = f'{ch_name} t={ti}'
+                    layer_name = ch_name
                 else:
                     cmap = 'gray'
                     blending = 'translucent'
-                    layer_name = f'Volume t={ti}'
+                    layer_name = 'Volume'
                 # Initialize contrast limits lazily on first load
                 if ch_name not in self.channel_contrast_limits:
                     self.channel_contrast_limits[ch_name] = [
@@ -1877,12 +1877,12 @@ class WormAnnotator:
             empty_vals  = np.zeros(3)
             surface = viewer_ref.add_surface(
                 (empty_verts, empty_faces, empty_vals),
-                name=f'Surface t={ti}', shading='smooth',
+                name='Surface', shading='smooth',
                 colormap='turbo', opacity=0.7)
             surface.interactive = False
             surface.visible = self.surface_visible
             pts = viewer_ref.add_points(
-                ndim=3, name=f'Annotations t={ti}', size=5, face_color='yellow')
+                ndim=3, name='Annotations', size=5, face_color='yellow')
             pts.mode = 'pan_zoom'  # prevent napari's native add-on-click
 
             if ti in self.grid_annotations and len(self.grid_annotations[ti]) > 0:
@@ -1890,25 +1890,25 @@ class WormAnnotator:
 
             # Lattice layers: left (cyan squares), right (magenta squares), lines (yellow)
             lat_l = viewer_ref.add_points(
-                ndim=3, name=f'Lattice Left t={ti}',  size=7,
+                ndim=3, name='Lattice Left',  size=7,
                 face_color='cyan',    symbol='square')
             lat_r = viewer_ref.add_points(
-                ndim=3, name=f'Lattice Right t={ti}', size=7,
+                ndim=3, name='Lattice Right', size=7,
                 face_color='magenta', symbol='square')
             lat_lines = viewer_ref.add_shapes(
-                ndim=3, name=f'Lattice Lines t={ti}',
+                ndim=3, name='Lattice Lines',
                 edge_color='yellow', edge_width=1, face_color='transparent')
             lat_mid = viewer_ref.add_shapes(
-                ndim=3, name=f'Lattice Mid t={ti}',
+                ndim=3, name='Lattice Mid',
                 edge_color='red', edge_width=1, face_color='transparent')
             lat_left_curve = viewer_ref.add_shapes(
-                ndim=3, name=f'Lattice Left Curve t={ti}',
+                ndim=3, name='Lattice Left Curve',
                 edge_color='magenta', edge_width=1, face_color='transparent')
             lat_right_curve = viewer_ref.add_shapes(
-                ndim=3, name=f'Lattice Right Curve t={ti}',
+                ndim=3, name='Lattice Right Curve',
                 edge_color='green', edge_width=1, face_color='transparent')
             wireframe = viewer_ref.add_shapes(
-                ndim=3, name=f'Wireframe t={ti}',
+                ndim=3, name='Wireframe',
                 edge_color='white', edge_width=0.5, face_color='transparent')
             wireframe.visible = self.wireframe_visible
             # Lock lattice layers to pan_zoom — our handler does all adding
