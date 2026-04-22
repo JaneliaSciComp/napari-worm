@@ -1250,7 +1250,17 @@ class DualViewWindow:
             dock_widget = qt_viewer.dockLayerList.widget()
             dock_layout = dock_widget.layout()
 
-            # --- "Layers" tab: reparent existing children + histogram ---
+            # --- Add histogram below layer controls (after display text) ---
+            controls_widget = qt_viewer.dockLayerControls.widget()
+            container = QWidget()
+            container_layout = QVBoxLayout(container)
+            container_layout.setContentsMargins(0, 0, 0, 0)
+            container_layout.setSpacing(0)
+            container_layout.addWidget(controls_widget)
+            container_layout.addWidget(hist_widget)
+            qt_viewer.dockLayerControls.setWidget(container)
+
+            # --- "Layers" tab: reparent existing children ---
             layers_tab = QWidget()
             layers_layout = QVBoxLayout(layers_tab)
             layers_layout.setContentsMargins(0, 0, 0, 0)
@@ -1260,8 +1270,6 @@ class DualViewWindow:
                 w = item.widget()
                 if w:
                     layers_layout.addWidget(w)
-            # Insert histogram at the top of the Layers tab
-            layers_layout.insertWidget(0, hist_widget)
 
             # --- "Tables" tab: annotation + lattice tables ---
             tables_tab = QWidget()
@@ -3080,13 +3088,16 @@ def main():
         # Load last-used path from settings file
         settings_file = Path.home() / ".napari_worm_settings.json"
         last_dir = ""
+        last_start = 100
         if settings_file.exists():
             try:
-                last_dir = json.loads(settings_file.read_text()).get("last_dir", "")
+                settings = json.loads(settings_file.read_text())
+                last_dir = settings.get("last_dir", "")
+                last_start = settings.get("last_start", 100)
             except Exception:
                 pass
 
-        # Build a small dialog with path text field + Browse button
+        # Build a small dialog with path text field + Browse button + start timepoint
         from qtpy.QtWidgets import (QDialog, QDialogButtonBox, QLineEdit,
                                      QPushButton)
         dlg = QDialog()
@@ -3102,6 +3113,16 @@ def main():
         path_row.addWidget(path_edit)
         path_row.addWidget(browse_btn)
         layout.addLayout(path_row)
+
+        start_row = QHBoxLayout()
+        start_row.addWidget(QLabel("Start timepoint:"))
+        start_spin = QSpinBox()
+        start_spin.setRange(0, 9999)
+        start_spin.setValue(last_start)
+        start_spin.setFixedWidth(80)
+        start_row.addWidget(start_spin)
+        start_row.addStretch()
+        layout.addLayout(start_row)
 
         def _browse():
             start = path_edit.text() or last_dir or "/Volumes"
@@ -3127,10 +3148,14 @@ def main():
         if not volume:
             print("No directory selected — exiting.")
             return
+        args.start = start_spin.value()
 
-        # Save the selected path for next time
+        # Save the selected path and start timepoint for next time
         try:
-            settings_file.write_text(json.dumps({"last_dir": volume}))
+            settings_file.write_text(json.dumps({
+                "last_dir": volume,
+                "last_start": args.start,
+            }))
         except Exception:
             pass
 
