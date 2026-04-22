@@ -27,8 +27,8 @@ from qtpy.QtCore import QEvent, QObject, Qt, QTimer
 from qtpy.QtGui import QKeySequence
 from qtpy.QtWidgets import (
     QApplication, QCheckBox, QFileDialog, QHBoxLayout, QHeaderView, QLabel,
-    QPushButton, QShortcut, QSpinBox, QSplitter, QTabWidget, QTableWidget,
-    QTableWidgetItem, QVBoxLayout, QWidget,
+    QMessageBox, QPushButton, QShortcut, QSpinBox, QSplitter, QTabWidget,
+    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 import pyqtgraph as pg
 
@@ -2616,6 +2616,20 @@ class WormAnnotator:
         new_left, new_right = self._left_spin.value(), self._right_spin.value()
         # Skip if timepoints haven't actually changed
         if (new_left, new_right) == self.grid_timepoints:
+            return
+        # Prevent loading same timepoint on both sides
+        if new_left == new_right:
+            QMessageBox.warning(
+                self.dual_window._host,
+                "Duplicate timepoint",
+                f"Left and right panels cannot both show timepoint {new_left}.\n"
+                "Please select different timepoints for each side.",
+            )
+            # Revert spinboxes to current values
+            self._nav_updating = True
+            self._left_spin.setValue(self.grid_timepoints[0])
+            self._right_spin.setValue(self.grid_timepoints[1])
+            self._nav_updating = False
             return
         self._load_dual_pair(new_left, new_right)
 
