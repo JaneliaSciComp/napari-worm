@@ -1988,6 +1988,51 @@ class WormAnnotator:
         for side in range(2):
             self._refresh_annotation_table(side)
             self._refresh_lattice_table(side)
+            self._refresh_point_labels(side)
+
+    def _refresh_point_labels(self, side: int):
+        """Update text labels on annotation and lattice point layers.
+
+        Sets ``layer.properties`` + ``layer.text`` so that napari renders a
+        label next to each point.  Must be called only *after* the layer's
+        ``.data`` is already up-to-date (i.e. after table refresh).
+        """
+        _text_style = dict(color='white', anchor='upper_left', size=8,
+                           translation=[0, 0, 15])
+
+        # --- Annotation labels: A0, A1, ... ---
+        pts = self.grid_points_layers[side]
+        if pts is not None:
+            n = len(pts.data)
+            if n > 0:
+                pts.properties = {'label': [f'A{i}' for i in range(n)]}
+                pts.text = {**_text_style, 'string': 'label', 'color': 'white'}
+            else:
+                pts.properties = {'label': []}
+                pts.text = None
+
+        # --- Lattice labels: pair_nameL / pair_nameR ---
+        ti = self.grid_timepoints[side] if side < len(self.grid_timepoints) else None
+        pair_names = self.lattice_pair_names.get(ti, []) if ti is not None else []
+
+        for layer, suffix, color in [
+            (self.lattice_left_layers[side],  'L', 'cyan'),
+            (self.lattice_right_layers[side], 'R', 'magenta'),
+        ]:
+            if layer is None:
+                continue
+            n = len(layer.data)
+            if n > 0:
+                labels = [
+                    f"{pair_names[i]['name']}{suffix}" if i < len(pair_names)
+                    else f"a{i}{suffix}"
+                    for i in range(n)
+                ]
+                layer.properties = {'label': labels}
+                layer.text = {**_text_style, 'string': 'label', 'color': color}
+            else:
+                layer.properties = {'label': []}
+                layer.text = None
 
     def _refresh_annotation_table(self, side: int):
         """Populate annotation table from current points layer data."""
@@ -2410,6 +2455,7 @@ class WormAnnotator:
             entry['left']  = lat_left_layer.data.copy()  if len(lat_left_layer.data)  > 0 else np.empty((0, 3))
             entry['right'] = lat_right_layer.data.copy() if len(lat_right_layer.data) > 0 else np.empty((0, 3))
             self._refresh_lattice_table(side_idx)
+            self._refresh_point_labels(side_idx)
         except Exception as exc:
             import traceback
             traceback.print_exc()
@@ -2474,6 +2520,7 @@ class WormAnnotator:
             entry['left']  = lat_left_layer.data.copy()
             entry['right'] = lat_right_layer.data.copy()
             self._refresh_lattice_table(side_idx)
+            self._refresh_point_labels(side_idx)
         except Exception as exc:
             import traceback
             traceback.print_exc()
@@ -2660,6 +2707,7 @@ class WormAnnotator:
         label = "left" if side_idx == 0 else "right"
         print(f"[t={timepoint} {label}] Added at z={pos[0]:.1f} y={pos[1]:.1f} x={pos[2]:.1f}")
         self._refresh_annotation_table(side_idx)
+        self._refresh_point_labels(side_idx)
 
     def _undo_last_point(self, viewer):
         if self.lattice_mode:
