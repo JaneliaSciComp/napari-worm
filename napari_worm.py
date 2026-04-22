@@ -1250,15 +1250,16 @@ class DualViewWindow:
             dock_widget = qt_viewer.dockLayerList.widget()
             dock_layout = dock_widget.layout()
 
-            # --- Add histogram + threshold below layer controls ---
-            controls_widget = qt_viewer.dockLayerControls.widget()
-            container = QWidget()
-            container_layout = QVBoxLayout(container)
-            container_layout.setContentsMargins(0, 0, 0, 0)
-            container_layout.setSpacing(0)
-            container_layout.addWidget(controls_widget)
+            # --- Build single combined panel: controls + threshold + histogram + layers/tables ---
+            combined = QVBoxLayout()
+            combined.setContentsMargins(0, 0, 0, 0)
+            combined.setSpacing(0)
 
-            # Threshold slider: single row — label + slider + value
+            # Layer controls (opacity, blending, etc.)
+            controls_widget = qt_viewer.dockLayerControls.widget()
+            combined.addWidget(controls_widget)
+
+            # Threshold slider
             from superqt import QLabeledDoubleSlider
             thresh_row = QHBoxLayout()
             thresh_row.setContentsMargins(8, 2, 8, 2)
@@ -1274,16 +1275,16 @@ class DualViewWindow:
             thresh_slider.valueChanged.connect(
                 lambda v: self._annotator._apply_threshold(int(v)))
             thresh_row.addWidget(thresh_slider)
-            container_layout.addLayout(thresh_row)
-            container_layout.addWidget(hist_widget)
+            combined.addLayout(thresh_row)
 
             if not hasattr(self, '_thresh_sliders'):
                 self._thresh_sliders = [None, None]
             self._thresh_sliders[side] = thresh_slider
 
-            qt_viewer.dockLayerControls.setWidget(container)
+            # Histogram
+            combined.addWidget(hist_widget)
 
-            # --- "Layers" tab: reparent existing children ---
+            # Layers tab: reparent existing layer list children
             layers_tab = QWidget()
             layers_layout = QVBoxLayout(layers_tab)
             layers_layout.setContentsMargins(0, 0, 0, 0)
@@ -1294,7 +1295,7 @@ class DualViewWindow:
                 if w:
                     layers_layout.addWidget(w)
 
-            # --- "Tables" tab: annotation + lattice tables ---
+            # Tables tab: annotation + lattice tables
             tables_tab = QWidget()
             tables_layout = QVBoxLayout(tables_tab)
             tables_layout.setContentsMargins(0, 0, 0, 0)
@@ -1306,7 +1307,6 @@ class DualViewWindow:
             ann_table = QTableWidget(0, 6)
             ann_table.setHorizontalHeaderLabels(["Name", "X", "Y", "Z", "Intensity", "Seg"])
             ann_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-            # Allow editing only on the Seg column (handled via delegate/flags)
             ann_table.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.SelectedClicked)
             ann_table.setSelectionBehavior(QTableWidget.SelectRows)
             ann_table.verticalHeader().setVisible(False)
@@ -1324,25 +1324,27 @@ class DualViewWindow:
             lat_table.verticalHeader().setVisible(False)
             tables_layout.addWidget(lat_table, stretch=1)
 
-            # --- Assemble QTabWidget ---
+            # Assemble Layers/Tables tabs
             tab_widget = QTabWidget()
             tab_widget.addTab(layers_tab, "Layers")
             tab_widget.addTab(tables_tab, "Tables")
-            dock_layout.addWidget(tab_widget)
+            combined.addWidget(tab_widget)
+
+            # Put combined layout into the dock
+            combined_widget = QWidget()
+            combined_widget.setLayout(combined)
+            dock_layout.addWidget(combined_widget)
+
+            # Hide the now-empty controls dock
+            qt_viewer.dockLayerControls.hide()
 
             self.annotation_tables[side] = ann_table
             self.lattice_tables[side] = lat_table
             self.tab_widgets[side] = tab_widget
 
-        # Tabify right viewer's docks behind left viewer's docks.
-        # raise_() to switch tabs is purely cosmetic — no layout recalculation,
-        # no GL resize, no freeze (unlike setVisible which forces a full relayout).
-        self._host.tabifyDockWidget(self._qt_left.dockLayerControls,
-                                    self._qt_right.dockLayerControls)
+        # Tabify the two layer list docks (only one pair of tabs now)
         self._host.tabifyDockWidget(self._qt_left.dockLayerList,
                                     self._qt_right.dockLayerList)
-        # Start with left viewer's tabs on top
-        self._qt_left.dockLayerControls.raise_()
         self._qt_left.dockLayerList.raise_()
 
         # Canvas click → switch active dock panel (MIPAV's setActiveRenderer)
@@ -1372,6 +1374,11 @@ class DualViewWindow:
     def setWindowTitle(self, title: str):
         self._host.setWindowTitle(title)
 
+    def update_dock_titles(self, t_left: int, t_right: int):
+        """Update dock tab labels to show timepoint numbers."""
+        self._qt_left.dockLayerList.setWindowTitle(f"t={t_left}")
+        self._qt_right.dockLayerList.setWindowTitle(f"t={t_right}")
+
     def resizeDocks(self, docks, sizes, orientation):
         self._host.resizeDocks(docks, sizes, orientation)
 
@@ -1381,10 +1388,8 @@ class DualViewWindow:
             return
         self._active_side = side
         if side == 0:
-            self._qt_left.dockLayerControls.raise_()
             self._qt_left.dockLayerList.raise_()
         else:
-            self._qt_right.dockLayerControls.raise_()
             self._qt_right.dockLayerList.raise_()
 
     def clear_all_highlights(self):
@@ -1646,7 +1651,7 @@ class WormAnnotator:
         # Set left dock area to 370 px so control labels are fully visible
         # (resizeDocks must be called after the window is shown)
         self.dual_window.resizeDocks(
-            [self.dual_window._qt_left.dockLayerControls],
+            [self.dual_window._qt_left.dockLayerList],
             [370],
             Qt.Horizontal,
         )
@@ -2062,6 +2067,7 @@ class WormAnnotator:
         self.dual_window.setWindowTitle(
             f"napari_worm  —  t={t_left} (left)  |  t={t_right} (right)  "
             f"[of {len(self.tiff_files)-1}]{ch_info}")
+        self.dual_window.update_dock_titles(t_left, t_right)
         print(f"Showing t={t_left} (left) and t={t_right} (right) of {len(self.tiff_files)-1}")
 
         # Update histogram LUT widgets — bind to first channel's image layer,
@@ -2069,13 +2075,14 @@ class WormAnnotator:
         self._update_histograms()
         self._refresh_tables()
 
-        # Auto-select the first image layer so layer controls default to volume
-        # (otherwise a Shapes layer like Wireframe is selected and controls
+        # Auto-select the first image layer on both sides so layer controls
+        # default to volume (otherwise Wireframe is selected and controls
         # for opacity/blending don't visually affect the volume)
-        img_layers = self.grid_image_layers[0]
-        if img_layers:
-            first_img = img_layers[0] if isinstance(img_layers, list) else img_layers
-            self.viewer_left.layers.selection.active = first_img
+        for side_viewer, side_idx in [(self.viewer_left, 0), (self.viewer_right, 1)]:
+            img_layers = self.grid_image_layers[side_idx]
+            if img_layers:
+                first_img = img_layers[0] if isinstance(img_layers, list) else img_layers
+                side_viewer.layers.selection.active = first_img
 
     def _apply_threshold(self, tmin: int):
         """Set lower contrast limit on all image layers (hides dim voxels).
