@@ -1250,7 +1250,7 @@ class DualViewWindow:
             dock_widget = qt_viewer.dockLayerList.widget()
             dock_layout = dock_widget.layout()
 
-            # --- Add histogram below layer controls (after display text) ---
+            # --- Add histogram below layer controls ---
             controls_widget = qt_viewer.dockLayerControls.widget()
             container = QWidget()
             container_layout = QVBoxLayout(container)
@@ -1661,9 +1661,81 @@ class WormAnnotator:
         save_btn.clicked.connect(
             lambda: self._save_annotations(self.viewer_left))
         layout.addWidget(save_btn)
+
+        help_btn = QPushButton("?")
+        help_btn.setFixedWidth(30)
+        help_btn.setToolTip("Show keyboard shortcuts and help")
+        help_btn.clicked.connect(self._show_help)
+        layout.addWidget(help_btn)
         layout.addSpacing(20)
 
         return nav
+
+    def _show_help(self):
+        """Show a floating help window with shortcuts and usage info."""
+        # Reuse existing window if still open
+        if hasattr(self, '_help_window') and self._help_window.isVisible():
+            self._help_window.raise_()
+            return
+
+        from qtpy.QtWidgets import QTextBrowser
+        win = QWidget(None, Qt.Window)
+        win.setWindowTitle("napari-worm Help")
+        win.resize(480, 520)
+        layout = QVBoxLayout(win)
+        layout.setContentsMargins(10, 10, 10, 10)
+        text = QTextBrowser()
+        text.setOpenExternalLinks(True)
+        text.setHtml("""
+<h2>napari-worm Shortcuts</h2>
+
+<h3>Annotation Mode (default)</h3>
+<table cellpadding="4">
+<tr><td><b>Cmd+Click</b></td><td>Place annotation at peak intensity</td></tr>
+<tr><td><b>Cmd+Z</b></td><td>Undo last annotation</td></tr>
+<tr><td><b>S</b> / <b>Cmd+S</b></td><td>Save annotations + lattice</td></tr>
+<tr><td><b>L</b></td><td>Switch to Lattice mode</td></tr>
+<tr><td><b>Delete</b></td><td>Remove selected table row</td></tr>
+</table>
+
+<h3>Lattice Mode (press L)</h3>
+<table cellpadding="4">
+<tr><td><b>Cmd+Click</b></td><td>Place lattice point (alternates L/R)</td></tr>
+<tr><td><b>Cmd+Shift+Click</b></td><td>Place seam cell (L/R pair)</td></tr>
+<tr><td><b>Cmd+Click on point</b></td><td>Select point, then drag to move</td></tr>
+<tr><td><b>Cmd+Click on curve</b></td><td>Insert new pair between existing</td></tr>
+<tr><td><b>Arrow keys</b></td><td>Nudge selected point by 1 voxel</td></tr>
+<tr><td><b>Cmd+Z</b></td><td>Undo last lattice operation</td></tr>
+<tr><td><b>D</b></td><td>Done — save and exit lattice mode</td></tr>
+<tr><td><b>L</b></td><td>Back to annotation mode</td></tr>
+</table>
+
+<h3>Navigation</h3>
+<table cellpadding="4">
+<tr><td><b>Right</b> / <b>]</b></td><td>Next timepoint pair</td></tr>
+<tr><td><b>Left</b> / <b>[</b></td><td>Previous timepoint pair</td></tr>
+<tr><td><b>Spinboxes</b></td><td>Type number + Enter to jump</td></tr>
+</table>
+
+<h3>Visualization</h3>
+<table cellpadding="4">
+<tr><td><b>W</b></td><td>Toggle wireframe mesh</td></tr>
+<tr><td><b>Shift+W</b></td><td>Toggle surface mesh</td></tr>
+<tr><td><b>Eye icon</b></td><td>Toggle channel visibility</td></tr>
+<tr><td><b>Click layer</b></td><td>Switch histogram to that channel</td></tr>
+</table>
+
+<h3>Tips</h3>
+<ul>
+<li>Click on either canvas to switch the left panel to that viewer's controls</li>
+<li>Click a row in the Tables tab to highlight that point in 3D</li>
+<li>Edit X/Y/Z coordinates directly in the table (double-click)</li>
+<li>Multi-channel: RegA (red) + RegB (green) auto-discovered from sibling folders</li>
+</ul>
+""")
+        layout.addWidget(text)
+        win.show()
+        self._help_window = win
 
     def _find_peak_multi_channel(self, near, far, side):
         """Find peak along ray by blending all channels (MIPAV accurate mode).
