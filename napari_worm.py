@@ -26,9 +26,10 @@ from dask import delayed
 from qtpy.QtCore import QEvent, QObject, Qt, QTimer
 from qtpy.QtGui import QKeySequence
 from qtpy.QtWidgets import (
-    QApplication, QCheckBox, QFileDialog, QHBoxLayout, QHeaderView, QLabel,
-    QMessageBox, QPushButton, QShortcut, QSlider, QSpinBox, QSplitter,
-    QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QHeaderView,
+    QLabel, QMessageBox, QPushButton, QShortcut, QSlider, QSpinBox,
+    QSplitter, QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout,
+    QWidget,
 )
 import pyqtgraph as pg
 
@@ -1312,9 +1313,23 @@ class DualViewWindow:
             ann_table.verticalHeader().setVisible(False)
             tables_layout.addWidget(ann_table, stretch=1)
 
+            lat_header = QHBoxLayout()
             lat_label = QLabel("Lattice")
             lat_label.setStyleSheet("font-weight: bold; padding: 4px;")
-            tables_layout.addWidget(lat_label)
+            lat_header.addWidget(lat_label)
+            lat_header.addStretch()
+            lat_header.addWidget(QLabel("Group:"))
+            group_filter = QComboBox()
+            group_filter.addItems(["All", "a (body)", "H (seam)", "V (seam)", "T (tail)"])
+            group_filter.setFixedWidth(90)
+            group_filter.currentTextChanged.connect(
+                lambda text, s=side: self._annotator._on_group_filter_changed(s, text))
+            lat_header.addWidget(group_filter)
+            tables_layout.addLayout(lat_header)
+
+            if not hasattr(self, '_group_filters'):
+                self._group_filters = [None, None]
+            self._group_filters[side] = group_filter
             lat_table = QTableWidget(0, 7)
             lat_table.setHorizontalHeaderLabels(
                 ["Pair", "L_X", "L_Y", "L_Z", "R_X", "R_Y", "R_Z"])
@@ -1323,6 +1338,42 @@ class DualViewWindow:
             lat_table.setSelectionBehavior(QTableWidget.SelectRows)
             lat_table.verticalHeader().setVisible(False)
             tables_layout.addWidget(lat_table, stretch=1)
+
+            # Mode toggle buttons: Annotation vs Lattice
+            mode_row = QHBoxLayout()
+            mode_row.setContentsMargins(4, 4, 4, 4)
+            ann_btn = QPushButton("Annotation")
+            ann_btn.setCheckable(True)
+            ann_btn.setChecked(True)
+            lat_btn = QPushButton("Lattice")
+            lat_btn.setCheckable(True)
+            lat_btn.setChecked(False)
+            ann_btn.setStyleSheet(
+                "QPushButton:checked { background-color: #b8a000; color: white; font-weight: bold; }"
+                "QPushButton { padding: 4px 8px; }")
+            lat_btn.setStyleSheet(
+                "QPushButton:checked { background-color: #0097a7; color: white; font-weight: bold; }"
+                "QPushButton { padding: 4px 8px; }")
+
+            def _on_ann_btn():
+                if self._annotator.lattice_mode:
+                    self._annotator._toggle_lattice_mode()
+                self._update_mode_buttons()
+            def _on_lat_btn():
+                if not self._annotator.lattice_mode:
+                    self._annotator._toggle_lattice_mode()
+                self._update_mode_buttons()
+            ann_btn.clicked.connect(_on_ann_btn)
+            lat_btn.clicked.connect(_on_lat_btn)
+            mode_row.addWidget(ann_btn)
+            mode_row.addWidget(lat_btn)
+            combined.addLayout(mode_row)
+
+            if not hasattr(self, '_mode_ann_btns'):
+                self._mode_ann_btns = [None, None]
+                self._mode_lat_btns = [None, None]
+            self._mode_ann_btns[side] = ann_btn
+            self._mode_lat_btns[side] = lat_btn
 
             # Assemble Layers/Tables tabs
             tab_widget = QTabWidget()
@@ -1378,6 +1429,15 @@ class DualViewWindow:
         """Update dock tab labels to show timepoint numbers."""
         self._qt_left.dockLayerList.setWindowTitle(f"t={t_left}")
         self._qt_right.dockLayerList.setWindowTitle(f"t={t_right}")
+
+    def _update_mode_buttons(self):
+        """Sync mode button checked state with annotator's lattice_mode."""
+        is_lattice = self._annotator.lattice_mode
+        for ann_btn, lat_btn in zip(self._mode_ann_btns, self._mode_lat_btns):
+            if ann_btn:
+                ann_btn.setChecked(not is_lattice)
+            if lat_btn:
+                lat_btn.setChecked(is_lattice)
 
     def resizeDocks(self, docks, sizes, orientation):
         self._host.resizeDocks(docks, sizes, orientation)
@@ -2225,6 +2285,10 @@ class WormAnnotator:
             table.setItem(i, 5, QTableWidgetItem("" if seg_val == -1 else str(seg_val)))
         table.blockSignals(False)
 
+    def _on_group_filter_changed(self, side: int, text: str):
+        """Re-filter lattice table rows when group dropdown changes."""
+        self._refresh_lattice_table(side)
+
     def _refresh_lattice_table(self, side: int):
         """Populate lattice table from current lattice layer data."""
         table = self.dual_window.lattice_tables[side]
@@ -2241,6 +2305,20 @@ class WormAnnotator:
         l_data = np.asarray(lat_l.data) if len(lat_l.data) > 0 else np.empty((0, 3))
         r_data = np.asarray(lat_r.data) if lat_r is not None and len(lat_r.data) > 0 else np.empty((0, 3))
         pair_names = self.lattice_pair_names.get(ti, []) if ti is not None else []
+
+        # Get active group filter
+        group_filter = ""
+        if hasattr(self.dual_window, '_group_filters') and self.dual_window._group_filters[side]:
+            group_text = self.dual_window._group_filters[side].currentText()
+            if group_text.startswith("a"):
+                group_filter = "a"
+            elif group_text.startswith("H"):
+                group_filter = "H"
+            elif group_text.startswith("V"):
+                group_filter = "V"
+            elif group_text.startswith("T"):
+                group_filter = "T"
+
         n_rows = max(len(l_data), len(r_data))
         table.setRowCount(n_rows)
         for i in range(n_rows):
@@ -2261,6 +2339,11 @@ class WormAnnotator:
                 table.setItem(i, 4, QTableWidgetItem(f"{x:.1f}"))
                 table.setItem(i, 5, QTableWidgetItem(f"{y:.1f}"))
                 table.setItem(i, 6, QTableWidgetItem(f"{z:.1f}"))
+            # Show/hide row based on group filter
+            if group_filter:
+                table.setRowHidden(i, not name.startswith(group_filter))
+            else:
+                table.setRowHidden(i, False)
         table.blockSignals(False)
 
     def _on_annotation_table_edited(self, side: int, row: int, col: int):
@@ -2533,6 +2616,9 @@ class WormAnnotator:
             print("  MODE: ANNOTATION  (Cmd+Click = annotate)")
             print("=" * 50)
             show_info("ANNOTATION MODE")
+        # Sync GUI buttons
+        if hasattr(self, 'dual_window'):
+            self.dual_window._update_mode_buttons()
 
     def _on_lattice_click(self, img_layer, event, _volume_data_unused,
                           side_idx, timepoint,
