@@ -27,7 +27,7 @@ from qtpy.QtCore import QEvent, QObject, Qt, QTimer
 from qtpy.QtGui import QKeySequence
 from qtpy.QtWidgets import (
     QApplication, QCheckBox, QFileDialog, QHBoxLayout, QHeaderView, QLabel,
-    QShortcut, QSpinBox, QSplitter, QTabWidget, QTableWidget,
+    QPushButton, QShortcut, QSpinBox, QSplitter, QTabWidget, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 import pyqtgraph as pg
@@ -1646,6 +1646,15 @@ class WormAnnotator:
         layout.addWidget(self._right_spin)
 
         layout.addStretch()
+
+        save_btn = QPushButton("Save")
+        save_btn.setToolTip(
+            "Save annotations and lattice for all visited timepoints (S)")
+        save_btn.clicked.connect(
+            lambda: self._save_annotations(self.viewer_left))
+        layout.addWidget(save_btn)
+        layout.addSpacing(20)
+
         return nav
 
     def _find_peak_multi_channel(self, near, far, side):
