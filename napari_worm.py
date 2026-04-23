@@ -1412,9 +1412,15 @@ class DualViewWindow:
 
         # Mirror viewer_right's status text into the host window's status bar
         # so the cursor position/value is always visible regardless of active canvas.
+        # napari >=0.5 emits status as a dict; older versions emit a string.
+        # showMessage() requires a string, so flatten dict → "name coords: value".
+        def _fmt_status(v):
+            if isinstance(v, dict):
+                return f"{v.get('layer_name', '')}{v.get('coordinates', '')}{v.get('value', '')}"
+            return str(v) if v is not None else ""
         if hasattr(viewer_right, 'status'):
             viewer_right.events.status.connect(
-                lambda e: self._host.statusBar().showMessage(e.value)
+                lambda e: self._host.statusBar().showMessage(_fmt_status(e.value))
                 if self._active_side == 1 else None
             )
 
@@ -1732,7 +1738,22 @@ class WormAnnotator:
         self._left_spin.committed.connect(self._on_spinbox_changed)
         layout.addWidget(self._left_spin)
 
-        layout.addStretch()
+        layout.addSpacing(10)
+
+        back_btn = QPushButton("◀ BACK")
+        back_btn.setToolTip(
+            "Save current timepoints and step back by 1 ([)")
+        back_btn.clicked.connect(lambda: self._grid_prev(self.viewer_left))
+        layout.addWidget(back_btn)
+
+        next_btn = QPushButton("NEXT ▶")
+        next_btn.setToolTip(
+            "Save current timepoints and advance by 1 (])")
+        next_btn.clicked.connect(lambda: self._grid_next(self.viewer_left))
+        layout.addWidget(next_btn)
+
+        layout.addSpacing(10)
+
         layout.addWidget(QLabel("Right t="))
         self._right_spin = _CommitOnEnterSpinBox()
         self._right_spin.setRange(0, max_t)
@@ -1743,7 +1764,7 @@ class WormAnnotator:
 
         layout.addStretch()
 
-        save_btn = QPushButton("Save")
+        save_btn = QPushButton("Save All")
         save_btn.setToolTip(
             "Save annotations and lattice for all visited timepoints (S)")
         save_btn.clicked.connect(
@@ -1800,9 +1821,10 @@ class WormAnnotator:
 
 <h3>Navigation</h3>
 <table cellpadding="4">
-<tr><td><b>Right</b> / <b>]</b></td><td>Next timepoint pair</td></tr>
-<tr><td><b>Left</b> / <b>[</b></td><td>Previous timepoint pair</td></tr>
-<tr><td><b>Spinboxes</b></td><td>Type number + Enter to jump</td></tr>
+<tr><td><b>NEXT ▶</b> / <b>Right</b> / <b>]</b></td><td>Auto-save current + step forward 1 (old right becomes new left)</td></tr>
+<tr><td><b>◀ BACK</b> / <b>Left</b> / <b>[</b></td><td>Auto-save current + step back 1</td></tr>
+<tr><td><b>Spinboxes</b></td><td>Type number + Enter to jump (no auto-save)</td></tr>
+<tr><td><b>Save All</b> / <b>S</b> / <b>Cmd+S</b></td><td>Save all visited timepoints to disk</td></tr>
 </table>
 
 <h3>Visualization</h3>
@@ -2886,6 +2908,67 @@ class WormAnnotator:
             print(msg)
             show_info(msg)
 
+    def _save_current_timepoints(self):
+        """Save annotations + lattice for the 2 currently displayed timepoints.
+
+        Matches MIPAV's saveAll() in PlugInDialogVolumeRenderDual.java:2729-2740,
+        which saves only imageIndex and imageIndex+1 (not the full visited history).
+        Called on NEXT/BACK so persistence happens as part of the advance.
+        """
+        self._save_grid_annotations_to_cache()
+        self._save_lattice_to_cache()
+
+        saved_ts = []
+        for ti in self.grid_timepoints:
+            stem = self.tiff_files[ti].stem
+            results_base = self.volume_path / stem / f"{stem}_results"
+
+            pts = self.grid_annotations.get(ti, np.empty((0, 3)))
+            ann_saved = False
+            if len(pts) > 0:
+                ann_dir = results_base / "integrated_annotation"
+                ann_dir.mkdir(parents=True, exist_ok=True)
+                segs = self.grid_annotation_segments.get(ti, [])
+                ann_saved = save_annotations(
+                    pts, ann_dir / "annotations_test.csv", segments=segs)
+
+            entry = self.lattice_annotations.get(ti, {})
+            left  = entry.get('left',  np.empty((0, 3)))
+            right = entry.get('right', np.empty((0, 3)))
+            lat_saved = False
+            if len(left) > 0 or len(right) > 0:
+                pair_names = self.lattice_pair_names.get(ti, [])
+                n_pairs = min(len(left), len(right))
+                rows = []
+                for i in range(n_pairs):
+                    prefix = (pair_names[i]['name'] if i < len(pair_names)
+                              else _lattice_pair_name(i))
+                    for pt, side in ((left[i], 'L'), (right[i], 'R')):
+                        rows.append({'name': prefix + side,
+                                     'x_voxels': pt[2], 'y_voxels': pt[1],
+                                     'z_voxels': pt[0],
+                                     'R': 255, 'G': 255, 'B': 255})
+                for i in range(n_pairs, len(left)):
+                    prefix = (pair_names[i]['name'] if i < len(pair_names)
+                              else _lattice_pair_name(i))
+                    pt = left[i]
+                    rows.append({'name': prefix + 'L',
+                                 'x_voxels': pt[2], 'y_voxels': pt[1],
+                                 'z_voxels': pt[0],
+                                 'R': 255, 'G': 255, 'B': 255})
+                lat_dir = results_base / "lattice_final"
+                lat_dir.mkdir(parents=True, exist_ok=True)
+                lat_saved = self._save_csv_retry(
+                    pd.DataFrame(rows), lat_dir / "lattice_test.csv")
+
+            if ann_saved or lat_saved:
+                saved_ts.append(ti)
+
+        if saved_ts:
+            msg = "Saved " + ", ".join(f"t={t}" for t in saved_ts)
+            print(msg)
+            show_info(msg)
+
     def _on_spinbox_changed(self):
         if self._nav_updating:
             return
@@ -2914,6 +2997,7 @@ class WormAnnotator:
         if t_right >= len(self.tiff_files) - 1:
             print("Already at last timepoint")
             return
+        self._save_current_timepoints()
         self._load_dual_pair(t_left + 1, t_right + 1)
 
     def _grid_prev(self, viewer):
@@ -2921,6 +3005,7 @@ class WormAnnotator:
         if t_left <= 0:
             print("Already at first timepoint")
             return
+        self._save_current_timepoints()
         self._load_dual_pair(t_left - 1, t_right - 1)
 
     def _on_click_dual(self, layer, event, side_idx, timepoint, points_layer):
