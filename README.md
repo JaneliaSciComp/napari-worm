@@ -19,6 +19,9 @@ Developed at the **Shroff Lab**, Janelia Research Campus.
 - **Insert / drag / nudge**: Click on curves to insert pairs, drag points to reposition, arrow keys to nudge by 1 voxel
 - **Wireframe mesh**: 32 longitudinal splines around elliptical cross-sections (toggle with `W` key), matching MIPAV's `generateCurves()` / `generateEllipses()` algorithm
 - **Surface mesh**: Solid triangle mesh rendered with smooth Phong shading and turbo colormap (toggle with `Shift+W`), matching MIPAV's `generateTriMesh()` — head/tail caps + body quads
+- **Arbitrary clip plane**: Per-timepoint arbitrary-orientation clipping with position and slab-thickness sliders. Shift+Drag on the canvas rotates the plane (MIPAV-style); red frame outline shows the clip slab. Volume ray-cast step size drops during drag for smooth interaction, then snaps back to full quality on release. Clips Image/Surface/Shapes/Points layers together.
+- **Dual-view navigation**: NEXT/BACK buttons (and `]`/`[`) advance the sliding-window pair with auto-save of annotations for currently displayed timepoints before moving — matches MIPAV's `PlugInDialogVolumeRenderDual` workflow.
+- **Threshold slider**: Global lower-contrast-limit slider in the layer-controls area, synced across both viewers and all channels. Non-destructive (adjusts contrast_limits, not data).
 - **MIPAV-compatible output**: Saves `annotations_test.csv` and `lattice_test.csv` per timepoint in the expected directory structure
 - **Toast notifications**: In-app notifications for save confirmations, mode changes, and seam cell placement
 
@@ -81,8 +84,9 @@ pixi run python napari_worm.py /path/to/RegB/ --no-grid
 | `D` | Done with lattice (save + exit lattice mode) |
 | `S` / `Cmd+S` | Save all (annotations + lattice) |
 | `Delete` / `Backspace` | Remove selected row in table |
-| `Right` / `]` | Next timepoint pair |
-| `Left` / `[` | Previous timepoint pair |
+| `Right` / `]` / NEXT button | Next timepoint pair (auto-saves current annotations first) |
+| `Left` / `[` / BACK button | Previous timepoint pair (auto-saves current annotations first) |
+| `Shift+Drag` on canvas | Rotate arbitrary clip plane (when clip is enabled) |
 | `Cmd+Z` | Undo last annotation or lattice point |
 | Arrow keys | Nudge selected lattice point by 1 voxel |
 
