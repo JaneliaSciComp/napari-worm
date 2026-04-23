@@ -841,6 +841,9 @@ class _ClipDragFilter(QObject):
                 if state['frame_visible']:
                     self._dragging = True
                     self._last = event.pos()
+                    # Drop volume ray-cast resolution (MIPAV trick) —
+                    # restored on release.
+                    self._ann._set_volume_quality(self._side, hi=False)
                     return True  # consume — vispy never sees this
         elif t == QEvent.MouseMove and self._dragging:
             cur = event.pos()
@@ -852,9 +855,10 @@ class _ClipDragFilter(QObject):
         elif t == QEvent.MouseButtonRelease and self._dragging:
             self._dragging = False
             self._last = None
-            # Force a final (non-throttled) refresh so the frame settles
-            # exactly on the last rotation state instead of whatever the
-            # throttle happened to catch.
+            # Restore crisp volume sampling and force a final (non-throttled)
+            # refresh so the frame settles exactly on the last rotation state
+            # instead of whatever the throttle happened to catch.
+            self._ann._set_volume_quality(self._side, hi=True)
             self._ann._flush_clip_refresh(self._side)
             return True
         return False
@@ -2428,6 +2432,35 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
                     layer.experimental_clipping_planes = planes
                 except Exception:
                     pass  # some layer types may reject — silently skip
+
+    def _set_volume_quality(self, side: int, hi: bool):
+        """Swap volume ray-cast step size between drag (coarse) and idle (fine).
+
+        Mirrors MIPAV's VolumeTriPlanarRenderBase.java:1933-1934 / 1985-1986
+        where fSample_mouseDragged=0.5 and fSample_mouseReleased=1.0 swap
+        the volume sample rate. Vispy's VolumeVisual exposes the equivalent
+        as `relative_step_size` (bigger = coarser = faster).
+
+        Uses private `canvas.layer_to_visual` from napari to reach the vispy
+        node — may break on napari upgrades.
+        """
+        qt_viewer = self.dual_window._qt_left if side == 0 else self.dual_window._qt_right
+        canvas = getattr(qt_viewer, 'canvas', None)
+        layer_to_visual = getattr(canvas, 'layer_to_visual', None)
+        if layer_to_visual is None:
+            return
+        step = 0.8 if hi else 2.0  # 0.8 = napari default; 2.0 ≈ 2.5× faster
+        viewer = self.viewer_left if side == 0 else self.viewer_right
+        for layer in viewer.layers:
+            vispy_layer = layer_to_visual.get(layer)
+            if vispy_layer is None:
+                continue
+            node = getattr(vispy_layer, 'node', None)
+            if node is not None and hasattr(node, 'relative_step_size'):
+                try:
+                    node.relative_step_size = step
+                except Exception:
+                    pass
 
     def _update_clip_frame(self, side: int):
         """Update the red frame rectangle Shapes layer for this side.
