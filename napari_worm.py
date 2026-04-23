@@ -816,6 +816,50 @@ class _TableDeleteFilter(QObject):
         return False
 
 
+class _ClipDragFilter(QObject):
+    """Intercept Shift+MouseDrag on the canvas to rotate the arbitrary clip plane.
+
+    Installed on the Qt canvas native widget BEFORE vispy processes events,
+    so the camera rotation is suppressed while the clip plane rotates.
+    Matches MIPAV's VolumeTriPlanarRenderBase.java:1921-1926 which swaps the
+    rotation target from the scene to ArbRotate() during the drag.
+    Only active when the current timepoint's frame_visible is true (the
+    equivalent of MIPAV's DisplayArb() gate).
+    """
+    def __init__(self, annotator, side: int):
+        super().__init__()
+        self._ann = annotator
+        self._side = side
+        self._dragging = False
+        self._last = None
+
+    def eventFilter(self, obj, event):
+        t = event.type()
+        if t == QEvent.MouseButtonPress:
+            if event.modifiers() & Qt.ShiftModifier:
+                state = self._ann._get_clip_state(self._side)
+                if state['frame_visible']:
+                    self._dragging = True
+                    self._last = event.pos()
+                    return True  # consume — vispy never sees this
+        elif t == QEvent.MouseMove and self._dragging:
+            cur = event.pos()
+            dx = cur.x() - self._last.x()
+            dy = cur.y() - self._last.y()
+            self._ann._rotate_clip_by_mouse(self._side, dx, dy)
+            self._last = cur
+            return True
+        elif t == QEvent.MouseButtonRelease and self._dragging:
+            self._dragging = False
+            self._last = None
+            # Force a final (non-throttled) refresh so the frame settles
+            # exactly on the last rotation state instead of whatever the
+            # throttle happened to catch.
+            self._ann._flush_clip_refresh(self._side)
+            return True
+        return False
+
+
 class _CanvasClickFilter(QObject):
     """Switch the active control panel when a canvas receives a mouse click.
 
@@ -1375,10 +1419,69 @@ class DualViewWindow:
             self._mode_ann_btns[side] = ann_btn
             self._mode_lat_btns[side] = lat_btn
 
-            # Assemble Layers/Tables tabs
+            # Clip tab — mirrors MIPAV's "Clip" tab in PlugInDialogVolumeRenderDual
+            # (JPanelClip_WM.java arbitrary plane: enable, position, thickness, frame)
+            clip_tab = QWidget()
+            clip_layout = QVBoxLayout(clip_tab)
+            clip_layout.setContentsMargins(8, 8, 8, 8)
+            clip_layout.setSpacing(6)
+
+            clip_enable = QCheckBox("Enable arbitrary clip plane")
+            clip_layout.addWidget(clip_enable)
+
+            clip_frame_cb = QCheckBox("Show plane frame (red outline)")
+            clip_layout.addWidget(clip_frame_cb)
+
+            pos_row = QHBoxLayout()
+            pos_lbl = QLabel("Position:")
+            pos_lbl.setFixedWidth(70)
+            pos_row.addWidget(pos_lbl)
+            clip_pos = QLabeledDoubleSlider(Qt.Horizontal)
+            pos_row.addWidget(clip_pos)
+            clip_layout.addLayout(pos_row)
+
+            thk_row = QHBoxLayout()
+            thk_lbl = QLabel("Thickness:")
+            thk_lbl.setFixedWidth(70)
+            thk_row.addWidget(thk_lbl)
+            clip_thk = QLabeledDoubleSlider(Qt.Horizontal)
+            thk_row.addWidget(clip_thk)
+            clip_layout.addLayout(thk_row)
+
+            clip_reset = QPushButton("Reset orientation (X-axis, center)")
+            clip_layout.addWidget(clip_reset)
+
+            clip_hint = QLabel(
+                "Rotate plane: Shift+Drag on canvas while frame is shown")
+            clip_hint.setStyleSheet("color: #888; font-size: 10px;")
+            clip_hint.setWordWrap(True)
+            clip_layout.addWidget(clip_hint)
+            clip_layout.addStretch()
+
+            if not hasattr(self, '_clip_controls'):
+                self._clip_controls = [None, None]
+            self._clip_controls[side] = {
+                'enable': clip_enable, 'frame': clip_frame_cb,
+                'position': clip_pos, 'thickness': clip_thk,
+                'reset': clip_reset,
+            }
+            # Wire controls → annotator state. Lambdas capture side via default arg.
+            clip_enable.toggled.connect(
+                lambda v, s=side: self._annotator._on_clip_control_changed(s, 'enabled', v))
+            clip_frame_cb.toggled.connect(
+                lambda v, s=side: self._annotator._on_clip_control_changed(s, 'frame_visible', v))
+            clip_pos.valueChanged.connect(
+                lambda v, s=side: self._annotator._on_clip_control_changed(s, 'position', float(v)))
+            clip_thk.valueChanged.connect(
+                lambda v, s=side: self._annotator._on_clip_control_changed(s, 'thickness', float(v)))
+            clip_reset.clicked.connect(
+                lambda _, s=side: self._annotator._reset_clip_plane(s))
+
+            # Assemble Layers/Tables/Clip tabs
             tab_widget = QTabWidget()
             tab_widget.addTab(layers_tab, "Layers")
             tab_widget.addTab(tables_tab, "Tables")
+            tab_widget.addTab(clip_tab, "Clip")
             combined.addWidget(tab_widget)
 
             # Put combined layout into the dock
@@ -1626,6 +1729,18 @@ class WormAnnotator:
         self.surface_visible: bool = False
         self.lattice_next_side: str = 'L'  # alternates L→R→L→R (nose to tail)
         self.lattice_last_placed: dict | None = None  # {'side_idx', 'timepoint', 'layer', 'char'}
+
+        # Arbitrary clip plane state — per timepoint, mirrors MIPAV's
+        # IntegratedWormData.clipArb + clipArbOn (PlugInDialogVolumeRenderDual.java:273).
+        # Key = timepoint. Each side's Clip UI reflects its current timepoint.
+        # Normal = rotation @ (0, 0, 1)  (default = +x world axis in napari (z,y,x) order;
+        # the actual direction doesn't matter — rotation makes it arbitrary).
+        self.clip_state: dict[int, dict] = {}
+        # Per-side frame-outline Shapes layers (populated in _load_dual_pair)
+        self.clip_frame_layers: list = [None, None]
+        # Per-side throttle timers for clip-plane updates during Shift+Drag.
+        # Coalesces expensive per-mouse-move layer updates to ~30fps.
+        self._clip_throttle_timers: list = [None, None]
         # Ordered list of pair metadata per timepoint:
         # [{name: 'a0', type: 'lattice'}, {name: 'H0', type: 'seam'}, ...]
         # The i-th entry corresponds to i-th L point and i-th R point in the layers
@@ -1650,6 +1765,13 @@ class WormAnnotator:
         # Build the single main window (MIPAV's JFrame equivalent)
         self.dual_window = DualViewWindow(self.viewer_left, self.viewer_right, nav_widget)
         self.dual_window._annotator = self
+
+        # Shift+Drag for arbitrary clip plane rotation. Qt event filter installed
+        # on the canvas BEFORE vispy — consumes the event so vispy's camera
+        # rotation is suppressed during plane rotation. Matches MIPAV's behavior
+        # where Ctrl+Drag rotates only the plane (VolumeTriPlanarRenderBase.java
+        # :1921-1926). Using Shift instead of Ctrl because napari on Mac remaps
+        # Cmd↔Ctrl, making 'Control' collide with Cmd+Click annotation.
 
         # Connect annotation table edits (Seg column) and row selection
         for side in range(2):
@@ -1706,6 +1828,14 @@ class WormAnnotator:
         self._arrow_filter_r = _ArrowKeyFilter(self, qt_right.canvas.native)
         qt_left.canvas.native.installEventFilter(self._arrow_filter_l)
         qt_right.canvas.native.installEventFilter(self._arrow_filter_r)
+
+        # Shift+Drag clip plane rotation — Qt-level filters on canvas widgets so
+        # vispy's camera rotation is suppressed during plane rotation (see
+        # _ClipDragFilter docstring for rationale vs viewer.mouse_drag_callbacks).
+        self._clip_drag_l = _ClipDragFilter(self, 0)
+        self._clip_drag_r = _ClipDragFilter(self, 1)
+        qt_left.canvas.native.installEventFilter(self._clip_drag_l)
+        qt_right.canvas.native.installEventFilter(self._clip_drag_r)
 
         # Show window FIRST so Qt initialises the GL context for both canvases,
         # then load layers.  If layers are added before the GL context exists,
@@ -1834,6 +1964,19 @@ class WormAnnotator:
 <tr><td><b>Eye icon</b></td><td>Toggle channel visibility</td></tr>
 <tr><td><b>Click layer</b></td><td>Switch histogram to that channel</td></tr>
 </table>
+
+<h3>Clipping (Clip tab)</h3>
+<table cellpadding="4">
+<tr><td><b>Enable arbitrary clip plane</b></td><td>Cut the volume with an arbitrary plane</td></tr>
+<tr><td><b>Show plane frame</b></td><td>Display red rectangle at the plane position</td></tr>
+<tr><td><b>Position slider</b></td><td>Move plane along its normal (from volume center)</td></tr>
+<tr><td><b>Thickness slider</b></td><td>0 = single plane; &gt;0 = slab (show only region between two parallel planes)</td></tr>
+<tr><td><b>Shift+Drag on canvas</b></td><td>Rotate plane (only when frame is shown)</td></tr>
+<tr><td><b>Reset orientation</b></td><td>Restore X-axis default at volume center</td></tr>
+</table>
+<p style="font-size: 11px; color: #888; margin-left: 4px;">
+Clip state is remembered per timepoint — each timepoint can have its own plane.
+</p>
 
 <h3>Tips</h3>
 <ul>
@@ -1993,9 +2136,18 @@ class WormAnnotator:
                 ndim=3, name='Wireframe',
                 edge_color='white', edge_width=0.5, face_color='transparent')
             wireframe.visible = self.wireframe_visible
+            clip_frame = viewer_ref.add_shapes(
+                ndim=3, name='Clip Frame',
+                edge_color='red', edge_width=1.0, face_color='transparent')
+            clip_frame.interactive = False
+            try:
+                clip_frame.current_shape_type = 'polygon'
+            except Exception:
+                pass
+            self.clip_frame_layers[side] = clip_frame
             # Lock lattice layers to pan_zoom — our handler does all adding
             for lyr in (lat_l, lat_r, lat_lines, lat_mid,
-                        lat_left_curve, lat_right_curve, wireframe):
+                        lat_left_curve, lat_right_curve, wireframe, clip_frame):
                 lyr.mode = 'pan_zoom'
             # Lock pts too if already in lattice mode (e.g. after timepoint change)
             if self.lattice_mode:
@@ -2166,6 +2318,12 @@ class WormAnnotator:
                 first_img = img_layers[0] if isinstance(img_layers, list) else img_layers
                 side_viewer.layers.selection.active = first_img
 
+        # Restore clip-plane state per-timepoint (matches MIPAV's updateClipPanel)
+        for side_idx in range(2):
+            self._refresh_clip_ui(side_idx)
+            self._apply_clip_planes(side_idx)
+            self._update_clip_frame(side_idx)
+
     def _apply_threshold(self, tmin: int):
         """Set lower contrast limit on all image layers (hides dim voxels).
 
@@ -2188,6 +2346,196 @@ class WormAnnotator:
                 sl.setValue(tmin)
                 sl.blockSignals(False)
         pass  # no print/notification — slider fires continuously
+
+    # ──────────────────────── Arbitrary clip plane ────────────────────────
+    # Mirrors MIPAV's CLIP_A (JPanelClip_WM.java + VolumeTriPlanarRenderBase.java).
+    # State stored per timepoint (like MIPAV's IntegratedWormData.clipArb).
+
+    @staticmethod
+    def _default_clip_state() -> dict:
+        return {
+            'enabled': False,
+            'rotation': np.eye(3),   # 3×3 matrix applied to default normal (0,0,1)
+            'position': 0.0,         # offset along normal from volume center, voxels
+            'thickness': 0.0,        # 0 = single plane; >0 = slab (pair of planes)
+            'frame_visible': False,
+        }
+
+    def _get_clip_state(self, side: int) -> dict:
+        ti = self.grid_timepoints[side]
+        if ti not in self.clip_state:
+            self.clip_state[ti] = self._default_clip_state()
+        return self.clip_state[ti]
+
+    def _volume_shape(self, side: int):
+        img_layers = self.grid_image_layers[side]
+        if img_layers is None:
+            return None
+        layer = img_layers[0] if isinstance(img_layers, list) else img_layers
+        return layer.data.shape   # (z, y, x)
+
+    def _compute_clip_plane(self, state: dict, shape) -> tuple:
+        """Return (position, normal) in napari (z, y, x) coordinates.
+
+        Default normal is (0, 0, 1) pointing along +x; state['rotation']
+        rotates it to any orientation. Position is measured along the normal
+        from the volume center.
+        """
+        default_normal = np.array([0.0, 0.0, 1.0])
+        normal = state['rotation'] @ default_normal
+        normal = normal / np.linalg.norm(normal)
+        center = np.array(shape) / 2.0
+        position = center + normal * state['position']
+        return position, normal
+
+    def _plane_frame_corners(self, position, normal, shape):
+        """Four corners of a square centered at `position`, lying in the plane."""
+        size = float(max(shape))  # matches MIPAV m_fMax
+        half = size / 2.0
+        # Orthonormal basis (right, up) in the plane
+        temp = np.array([0.0, 1.0, 0.0])
+        if abs(np.dot(normal, temp)) > 0.95:
+            temp = np.array([1.0, 0.0, 0.0])
+        right = np.cross(normal, temp)
+        right = right / np.linalg.norm(right)
+        up = np.cross(right, normal)  # unit
+        c0 = position - right * half - up * half
+        c1 = position + right * half - up * half
+        c2 = position + right * half + up * half
+        c3 = position - right * half + up * half
+        return np.stack([c0, c1, c2, c3])
+
+    def _apply_clip_planes(self, side: int):
+        """Push clip state to all Image and Surface layers on this side's viewer."""
+        state = self._get_clip_state(side)
+        shape = self._volume_shape(side)
+        if shape is None:
+            return
+        viewer = self.viewer_left if side == 0 else self.viewer_right
+        if not state['enabled']:
+            planes = []
+        else:
+            position, normal = self._compute_clip_plane(state, shape)
+            planes = [{'position': tuple(position), 'normal': tuple(normal),
+                       'enabled': True}]
+            if state['thickness'] > 0:
+                pos2 = position + normal * state['thickness']
+                planes.append({'position': tuple(pos2),
+                               'normal': tuple(-normal), 'enabled': True})
+        for layer in viewer.layers:
+            if hasattr(layer, 'experimental_clipping_planes'):
+                try:
+                    layer.experimental_clipping_planes = planes
+                except Exception:
+                    pass  # some layer types may reject — silently skip
+
+    def _update_clip_frame(self, side: int):
+        """Update the red frame rectangle Shapes layer for this side.
+
+        Uses in-place `data = [...]` assignment (relies on
+        current_shape_type='polygon' set at layer creation) to avoid the
+        remove_selected+add cycle which rebuilds vispy buffers.
+        """
+        frame_layer = self.clip_frame_layers[side]
+        if frame_layer is None:
+            return
+        state = self._get_clip_state(side)
+        shape = self._volume_shape(side)
+        if shape is None or not (state['enabled'] and state['frame_visible']):
+            if len(frame_layer.data) > 0:
+                frame_layer.data = []
+            return
+        position, normal = self._compute_clip_plane(state, shape)
+        corners = self._plane_frame_corners(position, normal, shape)
+        shapes_data = [corners]
+        if state['thickness'] > 0:
+            pos2 = position + normal * state['thickness']
+            corners2 = self._plane_frame_corners(pos2, normal, shape)
+            shapes_data.append(corners2)
+        frame_layer.data = shapes_data
+
+    def _refresh_clip_ui(self, side: int):
+        """Sync the Clip tab controls to the side's current state (no signals)."""
+        ctrls = self.dual_window._clip_controls[side]
+        if ctrls is None:
+            return
+        state = self._get_clip_state(side)
+        shape = self._volume_shape(side)
+        max_extent = float(max(shape)) if shape else 500.0
+        for key, w in ctrls.items():
+            if hasattr(w, 'blockSignals'):
+                w.blockSignals(True)
+        ctrls['enable'].setChecked(state['enabled'])
+        ctrls['frame'].setChecked(state['frame_visible'])
+        ctrls['position'].setRange(-max_extent / 2, max_extent / 2)
+        ctrls['position'].setValue(state['position'])
+        ctrls['thickness'].setRange(0, max_extent)
+        ctrls['thickness'].setValue(state['thickness'])
+        for key, w in ctrls.items():
+            if hasattr(w, 'blockSignals'):
+                w.blockSignals(False)
+
+    def _on_clip_control_changed(self, side: int, key: str, value):
+        state = self._get_clip_state(side)
+        state[key] = value
+        self._apply_clip_planes(side)
+        self._update_clip_frame(side)
+
+    def _reset_clip_plane(self, side: int):
+        state = self._get_clip_state(side)
+        state['rotation'] = np.eye(3)
+        state['position'] = 0.0
+        state['thickness'] = 0.0
+        self._refresh_clip_ui(side)
+        self._apply_clip_planes(side)
+        self._update_clip_frame(side)
+
+    def _rotate_clip_by_mouse(self, side: int, dx: float, dy: float):
+        """Virtual-trackball rotation from a mouse delta (pixels).
+
+        Matches MIPAV's VolumeTriPlanarRenderBase.java:1921-1926 where
+        Ctrl+Drag rotates m_kArbRotate while frame is displayed.
+        Simplified axis mapping: dx → rotate around world y (axis 1),
+        dy → rotate around world x (axis 2) in napari (z,y,x) order.
+
+        State updates immediately (so no rotation is lost); the expensive
+        layer/frame refresh is coalesced via a throttle timer.
+        """
+        sensitivity = 0.5  # degrees per pixel
+        ay = np.radians(dx * sensitivity)
+        ax = np.radians(-dy * sensitivity)
+        Ry = np.array([[ np.cos(ay), 0, np.sin(ay)],
+                       [ 0,          1, 0         ],
+                       [-np.sin(ay), 0, np.cos(ay)]])
+        Rx = np.array([[ np.cos(ax), -np.sin(ax), 0],
+                       [ np.sin(ax),  np.cos(ax), 0],
+                       [ 0,           0,          1]])
+        state = self._get_clip_state(side)
+        state['rotation'] = Rx @ Ry @ state['rotation']
+        self._schedule_clip_refresh(side)
+
+    def _schedule_clip_refresh(self, side: int):
+        """Schedule a throttled refresh of both planes and frame.
+
+        Both must update together — if only the frame moves, it gets
+        depth-occluded by the volume that's still clipped at the old
+        orientation. Coalesces rapid-fire mouse_move updates to ~30fps.
+        """
+        t = self._clip_throttle_timers[side]
+        if t is None:
+            from qtpy.QtCore import QTimer
+            t = QTimer()
+            t.setSingleShot(True)
+            t.setInterval(33)  # ~30fps
+            t.timeout.connect(lambda s=side: self._flush_clip_refresh(s))
+            self._clip_throttle_timers[side] = t
+        if not t.isActive():
+            t.start()
+
+    def _flush_clip_refresh(self, side: int):
+        """Apply planes + frame together so they stay visually in sync."""
+        self._apply_clip_planes(side)
+        self._update_clip_frame(side)
 
     def _save_grid_annotations_to_cache(self):
         for side, pts in enumerate(self.grid_points_layers):
