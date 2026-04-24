@@ -26,10 +26,10 @@ from dask import delayed
 from qtpy.QtCore import QEvent, QObject, Qt, QTimer
 from qtpy.QtGui import QKeySequence
 from qtpy.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QHeaderView,
-    QLabel, QMessageBox, QPushButton, QShortcut, QSlider, QSpinBox,
-    QSplitter, QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout,
-    QWidget,
+    QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout,
+    QHeaderView, QLabel, QMessageBox, QPushButton, QShortcut, QSlider,
+    QSpinBox, QSplitter, QTabWidget, QTableWidget, QTableWidgetItem,
+    QVBoxLayout, QWidget,
 )
 import pyqtgraph as pg
 
@@ -232,6 +232,146 @@ def save_annotations(points, filepath, names=None, segments=None):
     return False
 
 
+def _precalculate_cross_section_basis(n_max: int, n_samples: int) -> np.ndarray:
+    """Replicates MIPAV's precalculateCrossSectionBasis (LatticeModel.java:8352-8399).
+
+    Length-``n_samples`` impulse ``[1, 0, ..., 0]``, forward FFT, zero-padded into
+    a length-``n_max`` complex array at ``(n_max - n_samples)//2``, inverse FFT.
+    Returns the real part (length ``n_max``) — a bandlimited Dirichlet kernel.
+    Narrower ``n_samples`` → wider falloff; ``n_samples == n_max`` → impulse
+    (only the clicked vertex moves).
+    """
+    fft_shift_offset = (n_max - n_samples) // 2
+    impulse = np.zeros(n_samples)
+    impulse[0] = 1.0
+    fft = np.fft.fft(impulse)
+    padded = np.zeros(n_max, dtype=complex)
+    padded[fft_shift_offset:fft_shift_offset + n_samples] = fft
+    return np.real(np.fft.ifft(padded))
+
+
+def _precalculate_cross_section_bases(num_ellipse_pts: int = 32) -> dict[int, np.ndarray]:
+    """Precompute Fourier falloff kernels for all supported widths.
+
+    Matches MIPAV's ``precalculateCrossSectionBases`` (LatticeModel.java:8402-8412)
+    which stores kernels for ``nSamples ∈ {1, 2, 4, 8, 16, 32}`` indexed by
+    ``log2(nSamples)``. Returns a dict keyed by ``nSamples`` for direct lookup.
+    """
+    return {ns: _precalculate_cross_section_basis(num_ellipse_pts, ns)
+            for ns in (1, 2, 4, 8, 16, 32)}
+
+
+_CROSS_SECTION_BASES = _precalculate_cross_section_bases(32)
+
+
+def _apply_fourier_falloff(ring: np.ndarray, center: np.ndarray,
+                           selected_vertex: int, delta_length: float,
+                           n_samples: int, n_ellipse_pts: int = 32) -> np.ndarray:
+    """Apply MIPAV's Fourier-kernel radial falloff to one cross-section ring.
+
+    Mirrors the ``fourierPrecalculated`` branch of LatticeModel.updateLattice
+    (LatticeModel.java:8606-8661): each of the 32 ring vertices displaces
+    radially (toward/away from ``center``) by
+    ``kernel[i] * (n_ellipse_pts / n_samples) * delta_length`` where ``i`` is
+    the index offset from ``selected_vertex``.
+
+    - ``n_samples = 32`` → impulse kernel → only the clicked vertex moves
+      (the "Single" edit mode).
+    - ``n_samples ∈ {4, 8, 16}`` → bandlimited kernel → bulge of decreasing width
+      around the clicked vertex (Narrow / Medium / Wide).
+
+    Parameters
+    ----------
+    ring : (n_ellipse_pts, 3) absolute ring vertex positions
+    center : (3,) ring center point
+    selected_vertex : index of the vertex the user grabbed
+    delta_length : signed change in radius (positive = outward)
+    n_samples : one of the keys of ``_CROSS_SECTION_BASES``
+
+    Returns
+    -------
+    (n_ellipse_pts, 3) new ring positions. Input is not mutated.
+    """
+    if n_samples not in _CROSS_SECTION_BASES:
+        return ring.copy()
+    kernel = _CROSS_SECTION_BASES[n_samples]
+    ratio = n_ellipse_pts // n_samples
+    out = ring.copy()
+    for i in range(n_ellipse_pts):
+        idx = (selected_vertex + i) % n_ellipse_pts
+        vertex = out[idx]
+        radial = center - vertex
+        r_norm = np.linalg.norm(radial)
+        if r_norm < 1e-12:
+            continue
+        radial_unit = radial / r_norm
+        displacement = kernel[i] * ratio * delta_length
+        # MIPAV: current.sub(delta) — move vertex AWAY from center by positive displacement
+        out[idx] = vertex - radial_unit * displacement
+    return out
+
+
+def _save_cross_section_csv(path, ring_offsets: np.ndarray) -> bool:
+    """Write a single cross-section override to MIPAV latticeCrossSection_<i>.csv.
+
+    Format (matches LatticeModel.saveContourAsCSV, LatticeModel.java:6796-6835):
+        Contour
+        x_voxels,y_voxels,z_voxels
+        <x>,<y>,<z>
+        ... (num_ellipse_pts rows)
+        <trailing blank line>
+
+    `ring_offsets` is a (num_ellipse_pts, 3) array of CENTER-RELATIVE offsets in
+    napari (z, y, x) order; they are written as (x, y, z) to match MIPAV.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    import time
+    for attempt in range(5):
+        try:
+            with open(path, 'w') as f:
+                f.write("Contour\n")
+                f.write("x_voxels,y_voxels,z_voxels\n")
+                for off in ring_offsets:
+                    dz, dy, dx = float(off[0]), float(off[1]), float(off[2])
+                    f.write(f"{dx},{dy},{dz}\n")
+                f.write("\n")
+            return True
+        except BlockingIOError:
+            if attempt < 4:
+                time.sleep(1.0)
+    print(f"  WARNING: could not write {path} (network drive busy after 5 retries)")
+    return False
+
+
+def _load_cross_section_csv(path) -> np.ndarray | None:
+    """Read a MIPAV latticeCrossSection_<i>.csv into (num_ellipse_pts, 3) array
+    of center-relative offsets in napari (z, y, x) order.
+
+    Returns None if the file is missing, empty, or malformed.
+    """
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        offsets = []
+        with open(path, 'r') as f:
+            lines = [ln.strip() for ln in f if ln.strip()]
+        # Skip the two header lines: "Contour" and "x_voxels,y_voxels,z_voxels"
+        for line in lines[2:]:
+            parts = line.split(',')
+            if len(parts) != 3:
+                continue
+            dx, dy, dz = float(parts[0]), float(parts[1]), float(parts[2])
+            offsets.append((dz, dy, dx))
+        if not offsets:
+            return None
+        return np.asarray(offsets, dtype=float)
+    except (OSError, ValueError) as exc:
+        print(f"  WARNING: failed to read {path}: {exc}")
+        return None
+
+
 def _lattice_pair_name(pair_idx: int) -> str:
     """Return name prefix for the i-th L/R lattice pair (matches MIPAV a0/a1/... convention)."""
     return f"a{pair_idx}"
@@ -376,6 +516,34 @@ def _find_insertion_index(near: np.ndarray, far: np.ndarray,
     return None
 
 
+def _pick_ring_vertex(near: np.ndarray, far: np.ndarray,
+                      ellipse_rings: list[np.ndarray],
+                      threshold: float = 8.0):
+    """Find the ring vertex closest to the mouse ray.
+
+    Iterates all K rings × 32 vertices. Returns ``(ring_idx, vertex_idx, dist)``
+    or None if nothing is within ``threshold`` voxels.
+    """
+    best = None
+    for ring_idx, ring in enumerate(ellipse_rings):
+        for v_idx in range(len(ring)):
+            d = _point_to_ray_distance(ring[v_idx], near, far)
+            if d <= threshold and (best is None or d < best[2]):
+                best = (ring_idx, v_idx, d)
+    return best
+
+
+def _project_point_on_ray(p: np.ndarray, near: np.ndarray,
+                          far: np.ndarray) -> np.ndarray:
+    """Return the point on the infinite ray through ``near→far`` closest to ``p``."""
+    d = far - near
+    denom = np.dot(d, d)
+    if denom < 1e-12:
+        return near.copy()
+    t = np.dot(p - near, d) / denom
+    return near + t * d
+
+
 def _smooth_midline_spline(midpoints: np.ndarray, samples_per_segment: int = 20) -> np.ndarray:
     """Fit a natural cubic spline through midpoints (matching MIPAV's NaturalSpline3 BT_FREE).
 
@@ -435,71 +603,77 @@ def _make_spline_with_derivative(points: np.ndarray):
     return cs, cs_deriv
 
 
-def generate_wireframe_mesh(left_pts: np.ndarray, right_pts: np.ndarray,
-                            num_ellipse_pts: int = 32,
-                            num_samples: int = 0) -> list[np.ndarray]:
-    """Generate wireframe mesh from lattice L/R points (MIPAV generateCurves + generateEllipses).
+def _build_cross_section_rings(left_pts: np.ndarray, right_pts: np.ndarray,
+                               num_ellipse_pts: int,
+                               num_samples: int,
+                               lattice_aligned: bool,
+                               overrides: dict | None = None):
+    """Build ellipse cross-section rings along the center spline.
 
-    Algorithm (matching LatticeModel.java):
-    1. Compute center spline as midpoint of L/R pairs
-    2. Sample center spline uniformly (1-voxel steps)
-    3. At each sample: build orthogonal frame (tangent, right, up)
-    4. Draw ellipse in the (right, up) plane
-    5. Fit num_ellipse_pts longitudinal splines through corresponding ellipse points
-    6. Return paths for wireframe rendering
+    Returns (ellipse_rings, centers_on_rings) where:
+      ellipse_rings : list of (num_ellipse_pts, 3) arrays in world coords
+      centers_on_rings : (K, 3) array of ring center points (used for radial ops)
+    Or ([], []) if insufficient data.
 
-    Parameters
-    ----------
-    left_pts : (N, 3) array of left lattice points (z, y, x)
-    right_pts : (N, 3) array of right lattice points (z, y, x)
-    num_ellipse_pts : points per cross-section circle (MIPAV default: 32)
-    num_samples : number of uniformly-spaced cross-sections along center spline.
-                  0 = auto (1-voxel step size, matching MIPAV).
+    When lattice_aligned=True, K == N (one ring per lattice pair), centers and
+    L/R refs come from the actual lattice points (no spline drift), and ring
+    index == lattice slice index — matching MIPAV's displayContours layout and
+    latticeCrossSection_<i>.csv naming.
 
-    Returns
-    -------
-    List of (M, 3) arrays — each is a smooth longitudinal path for wireframe display.
-    Also includes cross-section rings.
+    When overrides is provided (dict[ring_idx, (num_ellipse_pts, 3) array]),
+    matching rings are replaced with `center + override[j]` for each vertex j
+    (center-relative world-frame offsets — matches MIPAV relativeCrossSections,
+    LatticeModel.java:4806-4830). Only applied when lattice_aligned=True, since
+    ring-indexed overrides only make sense against the lattice-slice layout.
     """
     n = min(len(left_pts), len(right_pts))
     if n < 3:
-        return []
+        return [], np.empty((0, 3))
 
-    # --- Step 1: Center, left, right splines ---
     centers = (left_pts[:n] + right_pts[:n]) / 2.0
     center_cs, center_deriv = _make_spline_with_derivative(centers)
     left_cs, _ = _make_spline_with_derivative(left_pts[:n])
     right_cs, _ = _make_spline_with_derivative(right_pts[:n])
     if center_cs is None or left_cs is None or right_cs is None:
-        return []
+        return [], np.empty((0, 3))
 
-    # --- Step 2: Uniform sampling along center spline (MIPAV: 1-voxel steps) ---
-    # Estimate total arc length
-    t_dense = np.linspace(0, 1, 500)
-    pts_dense = center_cs(t_dense)
-    arc_lengths = np.concatenate([[0], np.cumsum(
-        np.linalg.norm(np.diff(pts_dense, axis=0), axis=1))])
-    total_length = arc_lengths[-1]
-    if total_length < 1e-6:
-        return []
+    if lattice_aligned:
+        dists = np.linalg.norm(np.diff(centers, axis=0), axis=1)
+        cumlen = np.concatenate([[0.0], np.cumsum(dists)])
+        total = cumlen[-1]
+        if total < 1e-12:
+            return [], np.empty((0, 3))
+        t_samples = cumlen / total
+        # Use lattice control points directly — no spline-evaluation drift.
+        sample_centers = centers
+        sample_left = left_pts[:n]
+        sample_right = right_pts[:n]
+    else:
+        t_dense = np.linspace(0, 1, 500)
+        pts_dense = center_cs(t_dense)
+        arc_lengths = np.concatenate([[0], np.cumsum(
+            np.linalg.norm(np.diff(pts_dense, axis=0), axis=1))])
+        total_length = arc_lengths[-1]
+        if total_length < 1e-6:
+            return [], np.empty((0, 3))
+        if num_samples <= 0:
+            num_samples = max(int(np.ceil(total_length)), 10)
+        target_arcs = np.linspace(0, total_length, num_samples)
+        t_samples = np.interp(target_arcs, arc_lengths, t_dense)
+        sample_centers = center_cs(t_samples)
+        sample_left = left_cs(t_samples)
+        sample_right = right_cs(t_samples)
 
-    if num_samples <= 0:
-        num_samples = max(int(np.ceil(total_length)), 10)
-
-    # Find parameter values for uniformly-spaced arc-length positions
-    target_arcs = np.linspace(0, total_length, num_samples)
-    t_uniform = np.interp(target_arcs, arc_lengths, t_dense)
-
-    # --- Step 3 & 4: Build orthogonal frames and ellipses at each cross-section ---
     angles = np.linspace(0, 2 * np.pi, num_ellipse_pts, endpoint=False)
     cos_a = np.cos(angles)
     sin_a = np.sin(angles)
 
-    # ellipse_rings[i] = (num_ellipse_pts, 3) — points around i-th cross-section
     ellipse_rings = []
+    for i, t_val in enumerate(t_samples):
+        center = sample_centers[i]
+        left_pt = sample_left[i]
+        right_pt = sample_right[i]
 
-    for t_val in t_uniform:
-        center = center_cs(t_val)
         tangent = center_deriv(t_val)
         tangent_norm = np.linalg.norm(tangent)
         if tangent_norm < 1e-12:
@@ -507,13 +681,9 @@ def generate_wireframe_mesh(left_pts: np.ndarray, right_pts: np.ndarray,
         else:
             tangent = tangent / tangent_norm
 
-        # Right vector: from left curve to right curve at this parameter
-        left_pt = left_cs(t_val)
-        right_pt = right_cs(t_val)
         right_vec = right_pt - left_pt
         right_norm = np.linalg.norm(right_vec)
         if right_norm < 1e-12:
-            # Fallback: pick an arbitrary perpendicular
             if abs(tangent[0]) < 0.9:
                 right_vec = np.cross(tangent, np.array([1, 0, 0]))
             else:
@@ -521,8 +691,6 @@ def generate_wireframe_mesh(left_pts: np.ndarray, right_pts: np.ndarray,
             right_norm = np.linalg.norm(right_vec)
 
         right_vec = right_vec / right_norm
-
-        # Remove tangent component from right_vec (Gram-Schmidt) to ensure orthogonality
         right_vec = right_vec - np.dot(right_vec, tangent) * tangent
         rn = np.linalg.norm(right_vec)
         if rn < 1e-12:
@@ -534,23 +702,65 @@ def generate_wireframe_mesh(left_pts: np.ndarray, right_pts: np.ndarray,
         else:
             right_vec = right_vec / rn
 
-        # Up vector: cross product (matches MIPAV: upDir = cross(normal, rightDir))
         up_vec = np.cross(tangent, right_vec)
         up_vec = up_vec / np.linalg.norm(up_vec)
 
-        # Worm diameter at this point (distance between L and R curves)
         diameter = np.linalg.norm(right_pt - left_pt)
-        # Radius = half L/R distance (circular cross-section, matching MIPAV
-        # updateEllipseModel → makeEllipse2DA with single radius)
         radius = diameter / 2.0
 
-        # Generate circle points in the (right_vec, up_vec) plane
+        override_ring = None
+        if lattice_aligned and overrides is not None:
+            override_ring = overrides.get(i)
+
         ring = np.empty((num_ellipse_pts, 3))
-        for j in range(num_ellipse_pts):
-            ring[j] = center + radius * cos_a[j] * right_vec + radius * sin_a[j] * up_vec
+        if override_ring is not None and override_ring.shape == (num_ellipse_pts, 3):
+            for j in range(num_ellipse_pts):
+                ring[j] = center + override_ring[j]
+        else:
+            for j in range(num_ellipse_pts):
+                ring[j] = center + radius * cos_a[j] * right_vec + radius * sin_a[j] * up_vec
         ellipse_rings.append(ring)
 
-    # --- Step 5: Fit longitudinal splines through corresponding ellipse points ---
+    return ellipse_rings, np.asarray(sample_centers)
+
+
+def generate_wireframe_mesh(left_pts: np.ndarray, right_pts: np.ndarray,
+                            num_ellipse_pts: int = 32,
+                            num_samples: int = 0,
+                            lattice_aligned: bool = False,
+                            overrides: dict | None = None) -> list[np.ndarray]:
+    """Generate wireframe mesh from lattice L/R points (MIPAV generateCurves + generateEllipses).
+
+    Algorithm (matching LatticeModel.java):
+    1. Compute center spline as midpoint of L/R pairs
+    2. Sample center spline (uniform steps, or one ring per lattice pair when lattice_aligned)
+    3. At each sample: build orthogonal frame (tangent, right, up)
+    4. Draw ellipse in the (right, up) plane
+    5. Fit num_ellipse_pts longitudinal splines through corresponding ellipse points
+    6. Return paths for wireframe rendering
+
+    Parameters
+    ----------
+    left_pts : (N, 3) array of left lattice points (z, y, x)
+    right_pts : (N, 3) array of right lattice points (z, y, x)
+    num_ellipse_pts : points per cross-section circle (MIPAV default: 32)
+    num_samples : number of uniformly-spaced cross-sections along center spline.
+                  0 = auto (1-voxel step size). Ignored when lattice_aligned=True.
+    lattice_aligned : if True, place exactly one anchor ring per lattice pair at
+                      that pair's position. Ring index == lattice slice index,
+                      matching MIPAV's latticeCrossSection_<i>.csv format.
+
+    Returns
+    -------
+    List of (M, 3) arrays — each is a smooth longitudinal path for wireframe display.
+    Also includes cross-section rings.
+    """
+    ellipse_rings, _ = _build_cross_section_rings(
+        left_pts, right_pts, num_ellipse_pts, num_samples, lattice_aligned,
+        overrides=overrides)
+    if not ellipse_rings:
+        return []
+
     paths = []
 
     # Longitudinal curves (32 splines running nose-to-tail)
@@ -559,11 +769,12 @@ def generate_wireframe_mesh(left_pts: np.ndarray, right_pts: np.ndarray,
         spline_pts = _smooth_midline_spline(control_pts, samples_per_segment=5)
         paths.append(spline_pts)
 
-    # Cross-section rings (every few samples for wireframe look)
-    ring_step = max(1, num_samples // 20)  # ~20 cross-section rings
-    for i in range(0, num_samples, ring_step):
+    # Cross-section rings — show every anchor ring when lattice-aligned (they
+    # are the editable handles); else ~20 display rings for the dense wireframe.
+    K = len(ellipse_rings)
+    ring_step = 1 if lattice_aligned else max(1, K // 20)
+    for i in range(0, K, ring_step):
         ring = ellipse_rings[i]
-        # Close the ring by appending the first point
         closed_ring = np.vstack([ring, ring[0:1]])
         paths.append(closed_ring)
 
@@ -572,7 +783,9 @@ def generate_wireframe_mesh(left_pts: np.ndarray, right_pts: np.ndarray,
 
 def generate_surface_mesh(left_pts: np.ndarray, right_pts: np.ndarray,
                           num_ellipse_pts: int = 32,
-                          num_samples: int = 0):
+                          num_samples: int = 0,
+                          lattice_aligned: bool = False,
+                          overrides: dict | None = None):
     """Generate a triangle mesh from lattice L/R points (MIPAV generateTriMesh).
 
     Uses the same ellipse cross-section computation as generate_wireframe_mesh(),
@@ -586,83 +799,16 @@ def generate_surface_mesh(left_pts: np.ndarray, right_pts: np.ndarray,
         - Body: adjacent rings connected by quads (2 triangles each)
         - Tail cap: triangle fan from tail_center to last ring
 
+    When lattice_aligned=True, one ring per lattice pair (ring index == lattice
+    slice index), matching MIPAV's displayContours layout.
+
     Returns (vertices, faces, values) or None if insufficient data.
     """
-    n = min(len(left_pts), len(right_pts))
-    if n < 3:
+    ellipse_rings, _ = _build_cross_section_rings(
+        left_pts, right_pts, num_ellipse_pts, num_samples, lattice_aligned,
+        overrides=overrides)
+    if not ellipse_rings:
         return None
-
-    # --- Reuse the same spline + ellipse computation as wireframe ---
-    centers = (left_pts[:n] + right_pts[:n]) / 2.0
-    center_cs, center_deriv = _make_spline_with_derivative(centers)
-    left_cs, _ = _make_spline_with_derivative(left_pts[:n])
-    right_cs, _ = _make_spline_with_derivative(right_pts[:n])
-    if center_cs is None or left_cs is None or right_cs is None:
-        return None
-
-    # Uniform sampling along center spline (1-voxel steps)
-    t_dense = np.linspace(0, 1, 500)
-    pts_dense = center_cs(t_dense)
-    arc_lengths = np.concatenate([[0], np.cumsum(
-        np.linalg.norm(np.diff(pts_dense, axis=0), axis=1))])
-    total_length = arc_lengths[-1]
-    if total_length < 1e-6:
-        return None
-
-    if num_samples <= 0:
-        num_samples = max(int(np.ceil(total_length)), 10)
-
-    target_arcs = np.linspace(0, total_length, num_samples)
-    t_uniform = np.interp(target_arcs, arc_lengths, t_dense)
-
-    # Build ellipse rings at each cross-section
-    angles = np.linspace(0, 2 * np.pi, num_ellipse_pts, endpoint=False)
-    cos_a = np.cos(angles)
-    sin_a = np.sin(angles)
-
-    ellipse_rings = []
-    for t_val in t_uniform:
-        center = center_cs(t_val)
-        tangent = center_deriv(t_val)
-        tangent_norm = np.linalg.norm(tangent)
-        if tangent_norm < 1e-12:
-            tangent = np.array([1.0, 0.0, 0.0])
-        else:
-            tangent = tangent / tangent_norm
-
-        left_pt = left_cs(t_val)
-        right_pt = right_cs(t_val)
-        right_vec = right_pt - left_pt
-        right_norm = np.linalg.norm(right_vec)
-        if right_norm < 1e-12:
-            if abs(tangent[0]) < 0.9:
-                right_vec = np.cross(tangent, np.array([1, 0, 0]))
-            else:
-                right_vec = np.cross(tangent, np.array([0, 1, 0]))
-            right_norm = np.linalg.norm(right_vec)
-
-        right_vec = right_vec / right_norm
-        right_vec = right_vec - np.dot(right_vec, tangent) * tangent
-        rn = np.linalg.norm(right_vec)
-        if rn < 1e-12:
-            if abs(tangent[0]) < 0.9:
-                right_vec = np.cross(tangent, np.array([1, 0, 0]))
-            else:
-                right_vec = np.cross(tangent, np.array([0, 1, 0]))
-            right_vec = right_vec / np.linalg.norm(right_vec)
-        else:
-            right_vec = right_vec / rn
-
-        up_vec = np.cross(tangent, right_vec)
-        up_vec = up_vec / np.linalg.norm(up_vec)
-
-        diameter = np.linalg.norm(right_pt - left_pt)
-        radius = diameter / 2.0
-
-        ring = np.empty((num_ellipse_pts, 3))
-        for j in range(num_ellipse_pts):
-            ring[j] = center + radius * cos_a[j] * right_vec + radius * sin_a[j] * up_vec
-        ellipse_rings.append(ring)
 
     # --- Pack into (vertices, faces, values) matching MIPAV generateTriMesh ---
     S = len(ellipse_rings)  # number of cross-sections
@@ -1236,6 +1382,101 @@ class HistogramLUTWidget(QWidget):
         self._redraw_histogram()
 
 
+class _Toast(QFrame):
+    """A single toast message. Transient ones auto-dismiss via QTimer;
+    persistent ones keep a close button until the user clicks it."""
+
+    def __init__(self, msg: str, parent, closable: bool):
+        super().__init__(parent)
+        self.setObjectName("napari_worm_toast")
+        # Distinct styling for persistent (has close button) vs transient
+        border = "#666" if closable else "#444"
+        bg = "#353535" if closable else "#2b2b2b"
+        self.setStyleSheet(f"""
+            QFrame#napari_worm_toast {{
+                background: {bg}; border: 1px solid {border};
+                border-radius: 4px;
+            }}
+            QLabel {{ color: #eee; }}
+            QPushButton {{
+                color: #bbb; background: transparent; border: none;
+                font-size: 14px; font-weight: bold;
+            }}
+            QPushButton:hover {{ color: #fff; }}
+        """)
+        h = QHBoxLayout(self)
+        h.setContentsMargins(10, 6, 6, 6)
+        h.setSpacing(6)
+        label = QLabel(msg)
+        label.setWordWrap(True)
+        label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        h.addWidget(label, stretch=1)
+        if closable:
+            btn = QPushButton("×")
+            btn.setFixedSize(20, 20)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.clicked.connect(self.close)
+            h.addWidget(btn, alignment=Qt.AlignTop)
+
+
+class _ToastHost(QWidget):
+    """Bottom-right stacked notification overlay attached to a host window.
+
+    Owns two flavors of toast:
+      - transient: auto-dismiss after N ms (default 2.5s) — mode changes.
+      - persistent: close button, stays until the user clicks × — save paths,
+        errors, anything the user needs to read before it disappears.
+
+    Toasts stack vertically, newest on top. Resizing the host window
+    repositions the stack to keep it anchored to the bottom-right.
+    """
+
+    MARGIN = 16
+    MAX_WIDTH = 480
+
+    def __init__(self, host: QWidget):
+        super().__init__(host)
+        self._host = host
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self._layout.setSpacing(6)
+        self._layout.setAlignment(Qt.AlignBottom | Qt.AlignRight)
+        self._host.installEventFilter(self)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+        self.raise_()
+        self._reposition()
+
+    def eventFilter(self, obj, ev):
+        if obj is self._host and ev.type() in (QEvent.Resize, QEvent.Show):
+            self._reposition()
+        return False
+
+    def _reposition(self):
+        w = min(self.MAX_WIDTH, max(200, self._host.width() - 2 * self.MARGIN))
+        self.setFixedWidth(w)
+        self.adjustSize()
+        x = self._host.width() - w - self.MARGIN
+        y = self._host.height() - self.height() - self.MARGIN
+        self.move(x, max(self.MARGIN, y))
+        self.raise_()
+
+    def show_transient(self, msg: str, ms: int = 2500):
+        toast = _Toast(msg, self, closable=False)
+        self._append(toast)
+        QTimer.singleShot(ms, toast.deleteLater)
+
+    def show_persistent(self, msg: str):
+        toast = _Toast(msg, self, closable=True)
+        self._append(toast)
+
+    def _append(self, toast: _Toast):
+        self._layout.addWidget(toast)
+        toast.destroyed.connect(lambda *_: self._reposition())
+        self.show()
+        self._reposition()
+        self.raise_()
+
+
 class DualViewWindow:
     """Modifies viewer_left's native NapariQtMainWindow to host two independent
     canvases side-by-side with switchable left-side dock panels.
@@ -1282,6 +1523,11 @@ class DualViewWindow:
         vbox.addWidget(canvas_splitter, stretch=1)
         vbox.addWidget(nav_widget, stretch=0)
         self._host.setCentralWidget(central)
+
+        # Notification overlay: transient mode messages auto-dismiss, persistent
+        # save/error messages stay until the user closes them. Bypasses napari's
+        # own notification manager so we have uniform control over both.
+        self.toast_host = _ToastHost(self._host)
 
         # Per-viewer tab widgets inside dockLayerList:
         #   Tab 0 "Layers": existing layer list + histogram (as before)
@@ -1415,13 +1661,39 @@ class DualViewWindow:
             lat_btn.clicked.connect(_on_lat_btn)
             mode_row.addWidget(ann_btn)
             mode_row.addWidget(lat_btn)
+
+            # Wireframe + Mesh visibility toggles — same pattern (checkable + styled).
+            # Init unchecked; _update_mode_buttons() syncs them to the annotator's
+            # actual state once the annotator is attached.
+            wf_btn = QPushButton("Wireframe")
+            wf_btn.setCheckable(True)
+            wf_btn.setStyleSheet(
+                "QPushButton:checked { background-color: #546e7a; color: white; font-weight: bold; }"
+                "QPushButton { padding: 4px 8px; }")
+            mesh_btn = QPushButton("Mesh")
+            mesh_btn.setCheckable(True)
+            mesh_btn.setStyleSheet(
+                "QPushButton:checked { background-color: #6a1b9a; color: white; font-weight: bold; }"
+                "QPushButton { padding: 4px 8px; }")
+            wf_btn.clicked.connect(
+                lambda _=False: (self._annotator._toggle_wireframe(),
+                                 self._update_mode_buttons()))
+            mesh_btn.clicked.connect(
+                lambda _=False: (self._annotator._toggle_surface(),
+                                 self._update_mode_buttons()))
+            mode_row.addWidget(wf_btn)
+            mode_row.addWidget(mesh_btn)
             combined.addLayout(mode_row)
 
             if not hasattr(self, '_mode_ann_btns'):
                 self._mode_ann_btns = [None, None]
                 self._mode_lat_btns = [None, None]
+                self._mode_wf_btns  = [None, None]
+                self._mode_mesh_btns = [None, None]
             self._mode_ann_btns[side] = ann_btn
             self._mode_lat_btns[side] = lat_btn
+            self._mode_wf_btns[side]  = wf_btn
+            self._mode_mesh_btns[side] = mesh_btn
 
             # Clip tab — mirrors MIPAV's "Clip" tab in PlugInDialogVolumeRenderDual
             # (JPanelClip_WM.java arbitrary plane: enable, position, thickness, frame)
@@ -1481,11 +1753,68 @@ class DualViewWindow:
             clip_reset.clicked.connect(
                 lambda _, s=side: self._annotator._reset_clip_plane(s))
 
-            # Assemble Layers/Tables/Clip tabs
+            # --- Edit tab: cross-section ring editing (MIPAV parity) ---
+            edit_tab = QWidget()
+            edit_layout = QVBoxLayout(edit_tab)
+            edit_layout.setContentsMargins(8, 8, 8, 8)
+            edit_layout.setSpacing(6)
+
+            edit_title = QLabel("<b>Cross-section editing</b>")
+            edit_layout.addWidget(edit_title)
+
+            cs_enable = QCheckBox("Enable ring editing (Cmd+Click+Drag ring vertex)")
+            edit_layout.addWidget(cs_enable)
+
+            mode_lbl = QLabel("Falloff width:")
+            edit_layout.addWidget(mode_lbl)
+
+            # 4 mode buttons — checkable + exclusive (QButtonGroup)
+            from qtpy.QtWidgets import QButtonGroup
+            mode_row = QHBoxLayout()
+            cs_mode_group = QButtonGroup(edit_tab)
+            cs_mode_group.setExclusive(True)
+            cs_mode_buttons = {}
+            for label, ns_val in (("Single (32)", 32), ("Narrow (16)", 16),
+                                  ("Medium (8)", 8), ("Wide (4)", 4)):
+                btn = QPushButton(label)
+                btn.setCheckable(True)
+                if ns_val == 8:  # MIPAV default
+                    btn.setChecked(True)
+                cs_mode_group.addButton(btn)
+                mode_row.addWidget(btn)
+                cs_mode_buttons[ns_val] = btn
+                btn.clicked.connect(
+                    lambda _=False, n=ns_val: self._annotator._on_cross_section_mode_changed(n))
+            edit_layout.addLayout(mode_row)
+
+            cs_reset = QPushButton("Reset rings for current timepoints")
+            edit_layout.addWidget(cs_reset)
+            cs_reset.clicked.connect(
+                lambda: self._annotator._reset_cross_sections_current())
+
+            cs_hint = QLabel(
+                "Single: only clicked vertex · Narrow/Medium/Wide: Fourier "
+                "bulge around the click · all vertices move purely radially "
+                "from the ring center (MIPAV parity).")
+            cs_hint.setStyleSheet("color: #888; font-size: 10px;")
+            cs_hint.setWordWrap(True)
+            edit_layout.addWidget(cs_hint)
+            edit_layout.addStretch()
+
+            if not hasattr(self, '_cs_controls'):
+                self._cs_controls = [None, None]
+            self._cs_controls[side] = {
+                'enable': cs_enable, 'modes': cs_mode_buttons, 'reset': cs_reset}
+
+            cs_enable.toggled.connect(
+                lambda v: self._annotator._on_cross_section_enable_changed(v))
+
+            # Assemble Layers/Tables/Clip/Rings tabs
             tab_widget = QTabWidget()
             tab_widget.addTab(layers_tab, "Layers")
             tab_widget.addTab(tables_tab, "Tables")
             tab_widget.addTab(clip_tab, "Clip")
+            tab_widget.addTab(edit_tab, "Rings")
             combined.addWidget(tab_widget)
 
             # Put combined layout into the dock
@@ -1538,19 +1867,44 @@ class DualViewWindow:
     def setWindowTitle(self, title: str):
         self._host.setWindowTitle(title)
 
+    # ---- Notification helpers ------------------------------------------------
+    def toast(self, msg: str, ms: int = 2500):
+        """Short-lived toast for mode changes (Wireframe ON, LATTICE MODE, etc.)."""
+        self.toast_host.show_transient(msg, ms)
+
+    def toast_persistent(self, msg: str):
+        """Toast that stays until the user clicks × (save paths, errors, warnings)."""
+        self.toast_host.show_persistent(msg)
+
     def update_dock_titles(self, t_left: int, t_right: int):
         """Update dock tab labels to show timepoint numbers."""
         self._qt_left.dockLayerList.setWindowTitle(f"t={t_left}")
         self._qt_right.dockLayerList.setWindowTitle(f"t={t_right}")
 
     def _update_mode_buttons(self):
-        """Sync mode button checked state with annotator's lattice_mode."""
-        is_lattice = self._annotator.lattice_mode
+        """Sync mode button checked state with annotator's current modes.
+
+        Covers Annotation/Lattice plus Wireframe/Mesh visibility — keyboard
+        shortcuts (L / W / Shift+W) toggle the state directly, so the buttons
+        need to mirror whatever the annotator currently holds.
+        """
+        a = self._annotator
+        is_lattice = a.lattice_mode
         for ann_btn, lat_btn in zip(self._mode_ann_btns, self._mode_lat_btns):
             if ann_btn:
                 ann_btn.setChecked(not is_lattice)
             if lat_btn:
                 lat_btn.setChecked(is_lattice)
+        for wf_btn in getattr(self, '_mode_wf_btns', []):
+            if wf_btn and wf_btn.isChecked() != a.wireframe_visible:
+                wf_btn.blockSignals(True)
+                wf_btn.setChecked(a.wireframe_visible)
+                wf_btn.blockSignals(False)
+        for mesh_btn in getattr(self, '_mode_mesh_btns', []):
+            if mesh_btn and mesh_btn.isChecked() != a.surface_visible:
+                mesh_btn.blockSignals(True)
+                mesh_btn.setChecked(a.surface_visible)
+                mesh_btn.blockSignals(False)
 
     def resizeDocks(self, docks, sizes, orientation):
         self._host.resizeDocks(docks, sizes, orientation)
@@ -1733,6 +2087,19 @@ class WormAnnotator:
         self.surface_visible: bool = False
         self.lattice_next_side: str = 'L'  # alternates L→R→L→R (nose to tail)
         self.lattice_last_placed: dict | None = None  # {'side_idx', 'timepoint', 'layer', 'char'}
+
+        # Cross-section overrides — per timepoint, per ring-index, center-relative
+        # (num_ellipse_pts, 3) offsets. Mirrors MIPAV's relativeCrossSections
+        # (LatticeModel.java:4806-4830). Saved per-ring to
+        # model_crossSections/latticeCrossSection_<i>.csv — only edited rings
+        # get a CSV; others fall back to the default circle.
+        self.cross_section_overrides: dict[int, dict[int, np.ndarray]] = {}
+
+        # Cross-section editing mode state (MIPAV editingCrossSections +
+        # crossSectionSamples). When True, Cmd+Click+Drag picks a ring vertex
+        # and reshapes the ring via Fourier falloff of width `cross_section_n_samples`.
+        self.cross_section_edit_mode: bool = False
+        self.cross_section_n_samples: int = 8  # MIPAV default: Medium
 
         # Arbitrary clip plane state — per timepoint, mirrors MIPAV's
         # IntegratedWormData.clipArb + clipArbOn (PlugInDialogVolumeRenderDual.java:273).
@@ -1963,11 +2330,36 @@ class WormAnnotator:
 
 <h3>Visualization</h3>
 <table cellpadding="4">
-<tr><td><b>W</b></td><td>Toggle wireframe mesh</td></tr>
-<tr><td><b>Shift+W</b></td><td>Toggle surface mesh</td></tr>
+<tr><td><b>W</b></td><td>Toggle wireframe mesh (one anchor ring per lattice pair + 32 longitudinal splines)</td></tr>
+<tr><td><b>Shift+W</b></td><td>Toggle surface mesh (solid tube, quad-strip between rings, head/tail caps)</td></tr>
 <tr><td><b>Eye icon</b></td><td>Toggle channel visibility</td></tr>
 <tr><td><b>Click layer</b></td><td>Switch histogram to that channel</td></tr>
 </table>
+<p style="font-size: 11px; color: #888; margin-left: 4px;">
+Wireframe rings are lattice-aligned: ring <i>i</i> sits at lattice pair <i>i</i>, matching MIPAV.
+Any cross-section edits save per-ring to
+<code>&lt;results&gt;/model_crossSections/latticeCrossSection_&lt;i&gt;.csv</code>
+and reload automatically on next launch.
+</p>
+
+<h3>Ring editing (Rings tab)</h3>
+<table cellpadding="4">
+<tr><td><b>Enable ring editing</b></td><td>Turn on Cmd+Click+Drag on wireframe ring vertices</td></tr>
+<tr><td><b>Single (32)</b></td><td>Only the clicked vertex moves (MIPAV "direct")</td></tr>
+<tr><td><b>Narrow (16) / Medium (8) / Wide (4)</b></td><td>Fourier-kernel bulge: wider = more vertices affected</td></tr>
+<tr><td><b>Reset rings</b></td><td>Wipe overrides for both currently-displayed timepoints</td></tr>
+<tr><td><b>Cmd+Click+Drag</b></td><td>On a wireframe ring vertex: reshape that cross-section radially</td></tr>
+</table>
+<p style="font-size: 11px; color: #888; margin-left: 4px;">
+Requires Lattice mode (L) and the wireframe to be visible (W). Each drag moves
+all 32 vertices of the selected ring purely radially from its center — matches
+MIPAV's editingCrossSections behavior (<code>LatticeModel.java:8492-8665</code>).
+While "Enable ring editing" is on, Cmd+Click is captured for ring editing only
+(a click that misses every vertex does nothing — matches MIPAV, which ignores
+lattice add calls while in editingCrossSections mode; see
+<code>LatticeModel.java:1001-1004</code>). Uncheck to return to lattice placement.
+Save with <b>S</b> or <b>Save All</b>.
+</p>
 
 <h3>Clipping (Clip tab)</h3>
 <table cellpadding="4">
@@ -2068,6 +2460,13 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
         self.viewer_right.layers.clear()
         self.grid_timepoints = [t_left, t_right]
 
+        # Repopulate in-memory caches from disk for any timepoint we haven't
+        # touched this session. Matches MIPAV's behavior of picking up previously
+        # saved annotation/lattice CSVs on re-open.
+        for ti in (t_left, t_right):
+            self._load_annotations_from_disk(ti)
+            self._load_lattice_from_disk(ti)
+
         for side, (viewer_ref, ti) in enumerate(
                 [(self.viewer_left, t_left), (self.viewer_right, t_right)]):
 
@@ -2162,6 +2561,18 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
                 lat_l.data = cached_lat['left']
             if len(cached_lat.get('right', [])) > 0:
                 lat_r.data = cached_lat['right']
+            # Pull any existing cross-section overrides from disk (only once —
+            # if already loaded this session, keep the in-memory state).
+            if ti not in self.cross_section_overrides:
+                self._load_cross_sections_for_timepoint(ti)
+            # Register lattice/wireframe layers *before* the visual rebuild —
+            # _update_lattice_visuals looks up the active side via
+            # self.lattice_left_layers, so the new layers must be visible there
+            # first, otherwise the wireframe/surface rebuild silently skips.
+            self.lattice_left_layers[side]  = lat_l
+            self.lattice_right_layers[side] = lat_r
+            self.wireframe_layers[side]     = wireframe
+            self.surface_layers[side]       = surface
             self._update_lattice_visuals(lat_l, lat_r, lat_lines, lat_mid,
                                         lat_left_curve, lat_right_curve)
 
@@ -2185,6 +2596,33 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
                         event.position, event.view_direction, event.dims_displayed)
                     if near is None or far is None:
                         return
+
+                    # --- Cross-section ring editing (MIPAV editingCrossSections) ---
+                    # When Edit-tab's "Enable ring editing" is on, treat it as a
+                    # pure mode: Cmd+Click only edits rings and a miss is
+                    # swallowed (no accidental lattice points). Uncheck the box
+                    # to return to normal lattice placement.
+                    if self.cross_section_edit_mode:
+                        l_tmp = np.asarray(lat_l_ref.data)
+                        r_tmp = np.asarray(lat_r_ref.data)
+                        picked = None
+                        if min(len(l_tmp), len(r_tmp)) >= 3:
+                            overrides = self.cross_section_overrides.get(timepoint)
+                            rings, centers = _build_cross_section_rings(
+                                l_tmp, r_tmp, 32, 0, True, overrides=overrides)
+                            if rings:
+                                picked = _pick_ring_vertex(near, far, rings, threshold=12.0)
+                        if picked is not None:
+                            yield from self._handle_cross_section_drag(
+                                event, img_ref, side_idx, timepoint,
+                                lat_l_ref, lat_r_ref, lat_lines_ref, lat_mid_ref,
+                                lat_lc_ref, lat_rc_ref,
+                                pre_picked=picked, rings=rings, centers=centers)
+                        else:
+                            show_info("Ring edit miss — click closer to a wireframe vertex "
+                                      "(or uncheck Enable ring editing to place lattice).")
+                        return
+
                     peak = self._find_peak_multi_channel(near, far, side_idx)
                     pos = find_nucleus_centroid(
                         self._get_blended_volume(side_idx), peak)
@@ -2270,6 +2708,12 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
                     entry['left'] = lat_l_ref.data.copy() if len(lat_l_ref.data) > 0 else np.empty((0, 3))
                     entry['right'] = lat_r_ref.data.copy() if len(lat_r_ref.data) > 0 else np.empty((0, 3))
                     if dragged:
+                        # Final rebuild so the wireframe/surface reflect the
+                        # exact released lattice position (not the last
+                        # mouse_move frame, which can lag by a throttle tick).
+                        self._update_lattice_visuals(
+                            lat_l_ref, lat_r_ref, lat_lines_ref,
+                            lat_mid_ref, lat_lc_ref, lat_rc_ref)
                         print(f"[t={timepoint}] Released {name}")
                         self._refresh_tables()
 
@@ -2588,6 +3032,271 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
                 entry['left']  = lat_l.data.copy()
             if lat_r is not None and len(lat_r.data) > 0:
                 entry['right'] = lat_r.data.copy()
+
+    def _cross_section_dir(self, ti: int) -> Path:
+        """MIPAV path: <sharedOutputDir>/model_crossSections/ for timepoint ti."""
+        stem = self.tiff_files[ti].stem
+        return self.volume_path / stem / f"{stem}_results" / "model_crossSections"
+
+    def _save_cross_sections_for_timepoint(self, ti: int) -> list[str]:
+        """Write all cross-section overrides for ti to
+        model_crossSections/latticeCrossSection_<i>.csv. Any CSV in the dir
+        whose ring index is NOT in the current overrides dict is deleted —
+        mirrors MIPAV LatticeModel.saveCrossSections (line 2718) which
+        deletes the CSV for rings that are no longer edited.
+        """
+        overrides = self.cross_section_overrides.get(ti, {})
+        csdir = self._cross_section_dir(ti)
+        saved_paths = []
+
+        if overrides:
+            csdir.mkdir(parents=True, exist_ok=True)
+            for ring_idx, offsets in overrides.items():
+                path = csdir / f"latticeCrossSection_{ring_idx}.csv"
+                if _save_cross_section_csv(path, offsets):
+                    saved_paths.append(str(path))
+
+        # Clean up stale CSVs — any file in the dir whose ring index isn't
+        # in the current overrides dict should be removed (matches MIPAV).
+        if csdir.exists():
+            import re
+            for f in csdir.glob("latticeCrossSection_*.csv"):
+                m = re.match(r"latticeCrossSection_(\d+)\.csv", f.name)
+                if m and int(m.group(1)) not in overrides:
+                    try:
+                        f.unlink()
+                    except OSError:
+                        pass
+        return saved_paths
+
+    def _handle_cross_section_drag(self, event, img_ref, side_idx, timepoint,
+                                   lat_l_ref, lat_r_ref,
+                                   lat_lines_ref, lat_mid_ref,
+                                   lat_lc_ref, lat_rc_ref,
+                                   pre_picked, rings, centers):
+        """Cmd+Click+Drag on a ring vertex → reshape the ring with radial
+        Fourier falloff. Mirrors MIPAV LatticeModel.updateLattice
+        (LatticeModel.java:8492-8665).
+
+        Uses a generator (yield) pattern so it integrates with napari's
+        mouse_drag_callbacks protocol. `pre_picked`/`rings`/`centers` come
+        from the caller's pick-first check so the picking work isn't duplicated.
+        """
+        ring_idx, vert_idx, _dist = pre_picked
+        center = centers[ring_idx]
+        current_ring = rings[ring_idx].copy()
+        n_samples = self.cross_section_n_samples
+        mode_name = {32: 'Single', 16: 'Narrow', 8: 'Medium', 4: 'Wide'}.get(
+            n_samples, f'n={n_samples}')
+        print(f"[ring-edit t={timepoint}] Ring {ring_idx}, vertex {vert_idx}, "
+              f"mode={mode_name}")
+
+        yield  # first mouse_move
+
+        while event.type == 'mouse_move':
+            if 'Control' not in event.modifiers:
+                break
+            near2, far2 = img_ref.get_ray_intersections(
+                event.position, event.view_direction, event.dims_displayed)
+            if near2 is not None and far2 is not None:
+                current_vertex = current_ring[vert_idx]
+                radial = current_vertex - center
+                r_norm = np.linalg.norm(radial)
+                if r_norm >= 1e-9:
+                    radial_unit = radial / r_norm
+                    # Project mouse position onto the radial axis through the
+                    # current vertex (MIPAV: radialDirection, line 2376-2395).
+                    ray_pt = _project_point_on_ray(current_vertex, near2, far2)
+                    new_radius = float(np.dot(ray_pt - center, radial_unit))
+                    delta_length = new_radius - r_norm
+                    current_ring = _apply_fourier_falloff(
+                        current_ring, center, vert_idx, delta_length, n_samples)
+                    # Persist as center-relative override
+                    self.cross_section_overrides.setdefault(
+                        timepoint, {})[ring_idx] = current_ring - center
+                    self._update_lattice_visuals(
+                        lat_l_ref, lat_r_ref, lat_lines_ref,
+                        lat_mid_ref, lat_lc_ref, lat_rc_ref)
+            yield
+
+        # Mouse up: one final rebuild so the released state is authoritative.
+        self._update_lattice_visuals(
+            lat_l_ref, lat_r_ref, lat_lines_ref,
+            lat_mid_ref, lat_lc_ref, lat_rc_ref)
+        print(f"[ring-edit t={timepoint}] Released ring {ring_idx}")
+
+    def _on_cross_section_enable_changed(self, enabled: bool):
+        """UI checkbox → state. Mirror to both sides' checkboxes."""
+        self.cross_section_edit_mode = bool(enabled)
+        if hasattr(self, '_cs_controls'):
+            for ctrls in self._cs_controls:
+                if ctrls is None:
+                    continue
+                cb = ctrls['enable']
+                if cb.isChecked() != self.cross_section_edit_mode:
+                    cb.blockSignals(True)
+                    cb.setChecked(self.cross_section_edit_mode)
+                    cb.blockSignals(False)
+        try:
+            from napari.utils.notifications import show_info
+            show_info(f"Ring editing: {'ON' if enabled else 'OFF'}")
+        except Exception:
+            pass
+
+    def _on_cross_section_mode_changed(self, n_samples: int):
+        """Mode button clicked → state. Mirror to both sides."""
+        self.cross_section_n_samples = int(n_samples)
+        if hasattr(self, '_cs_controls'):
+            for ctrls in self._cs_controls:
+                if ctrls is None:
+                    continue
+                btn = ctrls['modes'].get(self.cross_section_n_samples)
+                if btn is not None and not btn.isChecked():
+                    btn.blockSignals(True)
+                    btn.setChecked(True)
+                    btn.blockSignals(False)
+
+    def _reset_cross_sections_current(self):
+        """Wipe cross-section overrides for both currently-displayed
+        timepoints and rebuild wireframe/surface. Stale CSVs on disk will
+        be deleted on next save via _save_cross_sections_for_timepoint."""
+        changed = False
+        for ti in self.grid_timepoints:
+            if ti in self.cross_section_overrides:
+                del self.cross_section_overrides[ti]
+                changed = True
+        if changed:
+            for side, lat_l in enumerate(self.lattice_left_layers):
+                lat_r = self.lattice_right_layers[side]
+                if lat_l is None or lat_r is None:
+                    continue
+                lat_lines = self.lattice_line_layers[side]
+                lat_mid   = self.lattice_mid_layers[side]
+                lat_lc    = self.lattice_left_curve_layers[side]
+                lat_rc    = self.lattice_right_curve_layers[side]
+                self._update_lattice_visuals(
+                    lat_l, lat_r, lat_lines, lat_mid, lat_lc, lat_rc)
+            try:
+                from napari.utils.notifications import show_info
+                show_info("Cross-section rings reset (save to persist delete)")
+            except Exception:
+                pass
+
+    def _load_cross_sections_for_timepoint(self, ti: int) -> int:
+        """Read any latticeCrossSection_*.csv files for ti into
+        self.cross_section_overrides[ti]. Returns the number of rings loaded.
+        Safe to call even when no CSVs exist.
+        """
+        csdir = self._cross_section_dir(ti)
+        if not csdir.exists():
+            return 0
+        import re
+        loaded = {}
+        for f in csdir.glob("latticeCrossSection_*.csv"):
+            m = re.match(r"latticeCrossSection_(\d+)\.csv", f.name)
+            if not m:
+                continue
+            ring_idx = int(m.group(1))
+            offsets = _load_cross_section_csv(f)
+            if offsets is not None:
+                loaded[ring_idx] = offsets
+        if loaded:
+            self.cross_section_overrides[ti] = loaded
+        return len(loaded)
+
+    def _load_lattice_from_disk(self, ti: int) -> bool:
+        """Read lattice_final/lattice_test.csv for ti and repopulate
+        self.lattice_annotations[ti] + self.lattice_pair_names[ti].
+        No-op if ti already has an in-memory entry or no file exists.
+        """
+        if ti in self.lattice_annotations:
+            return False
+        if ti < 0 or ti >= len(self.tiff_files):
+            return False
+        stem = self.tiff_files[ti].stem
+        path = (self.volume_path / stem / f"{stem}_results"
+                / "lattice_final" / "lattice_test.csv")
+        if not path.exists():
+            return False
+        try:
+            df = pd.read_csv(path)
+        except Exception as e:
+            print(f"  WARNING: could not read {path}: {e}")
+            return False
+        pairs: dict[str, dict[str, np.ndarray]] = {}
+        order: list[str] = []
+        for _, row in df.iterrows():
+            name = str(row['name'])
+            if len(name) < 2 or name[-1] not in ('L', 'R'):
+                continue
+            prefix, side = name[:-1], name[-1]
+            if prefix not in pairs:
+                pairs[prefix] = {}
+                order.append(prefix)
+            pairs[prefix][side] = np.array([
+                float(row['z_voxels']),
+                float(row['y_voxels']),
+                float(row['x_voxels']),
+            ])
+        left_pts, right_pts, pair_infos = [], [], []
+        for prefix in order:
+            p = pairs[prefix]
+            if 'L' in p:
+                left_pts.append(p['L'])
+            if 'R' in p:
+                right_pts.append(p['R'])
+            ptype = 'seam' if prefix in _SEAM_CELL_SEQUENCE else 'lattice'
+            pair_infos.append({'name': prefix, 'type': ptype})
+        if not left_pts and not right_pts:
+            return False
+        self.lattice_annotations[ti] = {
+            'left':  np.asarray(left_pts)  if left_pts  else np.empty((0, 3)),
+            'right': np.asarray(right_pts) if right_pts else np.empty((0, 3)),
+        }
+        self.lattice_pair_names[ti] = pair_infos
+        self.lattice_seam_counter[ti] = [
+            p['name'] for p in pair_infos if p['type'] == 'seam']
+        print(f"  Lattice t={ti}: loaded {len(left_pts)}L + {len(right_pts)}R from disk")
+        return True
+
+    def _load_annotations_from_disk(self, ti: int) -> bool:
+        """Read integrated_annotation/annotations_test.csv for ti and repopulate
+        self.grid_annotations[ti] + segments. No-op if already cached or absent.
+        """
+        if ti in self.grid_annotations and len(self.grid_annotations[ti]) > 0:
+            return False
+        if ti < 0 or ti >= len(self.tiff_files):
+            return False
+        stem = self.tiff_files[ti].stem
+        path = (self.volume_path / stem / f"{stem}_results"
+                / "integrated_annotation" / "annotations_test.csv")
+        if not path.exists():
+            return False
+        try:
+            df = pd.read_csv(path)
+        except Exception as e:
+            print(f"  WARNING: could not read {path}: {e}")
+            return False
+        if len(df) == 0:
+            return False
+        pts = np.stack([
+            df['z_voxels'].to_numpy(dtype=float),
+            df['y_voxels'].to_numpy(dtype=float),
+            df['x_voxels'].to_numpy(dtype=float),
+        ], axis=1)
+        self.grid_annotations[ti] = pts
+        if 'lattice_segment' in df.columns:
+            segs = []
+            for v in df['lattice_segment']:
+                try:
+                    segs.append(int(v))
+                except (ValueError, TypeError):
+                    segs.append(-1)
+            self.grid_annotation_segments[ti] = segs
+        else:
+            self.grid_annotation_segments[ti] = [-1] * len(pts)
+        print(f"  Annotations t={ti}: loaded {len(pts)} points from disk")
+        return True
 
     def _refresh_tables(self):
         """Refresh both annotation and lattice tables for both sides."""
@@ -3197,34 +3906,42 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
                                 shape_type='path')
 
         # --- Wireframe mesh (32 longitudinal splines + cross-section rings) ---
-        # Only compute when wireframe is visible (W key) — expensive operation
-        if self.wireframe_visible:
-            wf_layer = None
-            for side, ll in enumerate(self.lattice_left_layers):
-                if ll is lat_l:
-                    wf_layer = self.wireframe_layers[side]
-                    break
+        # Only compute when wireframe is visible (W key) — expensive operation.
+        # Use lattice-aligned mode + per-timepoint cross-section overrides so
+        # ring index == lattice slice index (MIPAV parity).
+        active_side = None
+        for side, ll in enumerate(self.lattice_left_layers):
+            if ll is lat_l:
+                active_side = side
+                break
+        ti = (self.grid_timepoints[active_side]
+              if active_side is not None and active_side < len(self.grid_timepoints)
+              else None)
+        overrides = self.cross_section_overrides.get(ti) if ti is not None else None
+
+        if self.wireframe_visible and active_side is not None:
+            wf_layer = self.wireframe_layers[active_side]
             if wf_layer is not None:
                 _clear_shapes(wf_layer)
                 if n >= 3:
                     left_data = np.asarray(lat_l.data)
                     right_data = np.asarray(lat_r.data)
-                    paths = generate_wireframe_mesh(left_data, right_data)
+                    paths = generate_wireframe_mesh(
+                        left_data, right_data,
+                        lattice_aligned=True, overrides=overrides)
                     for path in paths:
                         if len(path) >= 2:
                             wf_layer.add(path, shape_type='path')
 
         # --- Surface mesh (triangle mesh, Shift+W) ---
-        if self.surface_visible:
-            surf_layer = None
-            for side, ll in enumerate(self.lattice_left_layers):
-                if ll is lat_l:
-                    surf_layer = self.surface_layers[side]
-                    break
+        if self.surface_visible and active_side is not None:
+            surf_layer = self.surface_layers[active_side]
             if surf_layer is not None and n >= 3:
                 left_data = np.asarray(lat_l.data)
                 right_data = np.asarray(lat_r.data)
-                result = generate_surface_mesh(left_data, right_data)
+                result = generate_surface_mesh(
+                    left_data, right_data,
+                    lattice_aligned=True, overrides=overrides)
                 if result is not None:
                     surf_layer.data = result
 
@@ -3284,6 +4001,18 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
             print(f"  Lattice t={ti}: {len(rows)} points → {save_path}")
             saved_paths.append(str(save_path))
             saved += 1
+
+        # Cross-section overrides — save for every timepoint with edits.
+        # Also handles the "user deleted all overrides" case via stale-CSV cleanup.
+        for ti in set(list(self.cross_section_overrides.keys())
+                      + [t for t in self.lattice_annotations.keys()]):
+            if ti < 0 or ti >= len(self.tiff_files):
+                continue
+            cs_saved = self._save_cross_sections_for_timepoint(ti)
+            if cs_saved:
+                print(f"  Cross-sections t={ti}: {len(cs_saved)} ring(s)")
+                saved_paths.extend(cs_saved)
+
         if saved:
             msg = f"Lattice saved for {saved} timepoint(s):\n" + "\n".join(saved_paths)
             print(msg)
@@ -3342,7 +4071,12 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
                 lat_saved = self._save_csv_retry(
                     pd.DataFrame(rows), lat_dir / "lattice_test.csv")
 
-            if ann_saved or lat_saved:
+            # Cross-section overrides (MIPAV model_crossSections/)
+            cs_saved = self._save_cross_sections_for_timepoint(ti)
+            if cs_saved:
+                print(f"  Cross-sections t={ti}: {len(cs_saved)} ring(s)")
+
+            if ann_saved or lat_saved or cs_saved:
                 saved_ts.append(ti)
 
         if saved_ts:
@@ -3663,6 +4397,8 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
         state = "ON" if self.wireframe_visible else "OFF"
         print(f"Wireframe: {state}")
         show_info(f"Wireframe: {state}")
+        if hasattr(self, 'dual_window') and self.dual_window is not None:
+            self.dual_window._update_mode_buttons()
 
     def _toggle_surface(self):
         """Toggle surface mesh visibility. Rebuilds mesh when turning on."""
@@ -3689,6 +4425,8 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
             print("  SURFACE MESH: OFF")
             print("=" * 50)
             show_info("Surface: OFF")
+        if hasattr(self, 'dual_window') and self.dual_window is not None:
+            self.dual_window._update_mode_buttons()
 
     def _on_lattice_done(self):
         """Exit lattice mode (use S to save)."""
@@ -3708,28 +4446,36 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
     def _save_annotations(self, viewer):
         if self.use_grid:
             self._save_grid_annotations_to_cache()
-            if not self.grid_annotations:
-                print("No annotations to save")
-                show_info("No annotations to save")
+            self._save_lattice_to_cache()
+            has_annotations = any(len(pts) > 0 for pts in self.grid_annotations.values())
+            has_lattice = any(
+                (len(e.get('left', [])) + len(e.get('right', []))) > 0
+                for e in self.lattice_annotations.values()
+            )
+            has_rings = bool(self.cross_section_overrides)
+            if not (has_annotations or has_lattice or has_rings):
+                print("Nothing to save")
+                show_info("Nothing to save")
                 return
             total = 0
             ann_paths = []
-            for ti, pts in sorted(self.grid_annotations.items()):
-                if len(pts) == 0:
-                    continue
-                stem = self.tiff_files[ti].stem
-                ann_dir = (self.volume_path / stem / f"{stem}_results"
-                           / "integrated_annotation")
-                ann_dir.mkdir(parents=True, exist_ok=True)
-                save_path = ann_dir / "annotations_test.csv"
-                segs = self.grid_annotation_segments.get(ti, [])
-                if save_annotations(pts, save_path, segments=segs):
-                    total += len(pts)
-                    ann_paths.append(str(save_path))
-                    print(f"  Saved {len(pts)} to {save_path}")
-            msg = f"Saved {total} annotations across {len(self.grid_annotations)} timepoint(s):\n" + "\n".join(ann_paths)
-            print(msg)
-            show_info(msg)
+            if has_annotations:
+                for ti, pts in sorted(self.grid_annotations.items()):
+                    if len(pts) == 0:
+                        continue
+                    stem = self.tiff_files[ti].stem
+                    ann_dir = (self.volume_path / stem / f"{stem}_results"
+                               / "integrated_annotation")
+                    ann_dir.mkdir(parents=True, exist_ok=True)
+                    save_path = ann_dir / "annotations_test.csv"
+                    segs = self.grid_annotation_segments.get(ti, [])
+                    if save_annotations(pts, save_path, segments=segs):
+                        total += len(pts)
+                        ann_paths.append(str(save_path))
+                        print(f"  Saved {len(pts)} to {save_path}")
+                msg = f"Saved {total} annotations across {len(self.grid_annotations)} timepoint(s):\n" + "\n".join(ann_paths)
+                print(msg)
+                show_info(msg)
             self._save_lattice()
         else:
             if not hasattr(self, 'points_layer') or len(self.points_layer.data) == 0:

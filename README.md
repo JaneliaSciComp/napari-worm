@@ -17,8 +17,9 @@ Developed at the **Shroff Lab**, Janelia Research Campus.
 - **Lattice mode**: Build left/right lattice pairs (nose-to-tail), with smooth natural cubic spline curves matching MIPAV's `NaturalSpline3(BT_FREE)`
 - **Seam cells**: Cmd+Shift+Click to mark seam cells (H0, H1, H2, V1-V6, T) with automatic MIPAV-compatible naming
 - **Insert / drag / nudge**: Click on curves to insert pairs, drag points to reposition, arrow keys to nudge by 1 voxel
-- **Wireframe mesh**: 32 longitudinal splines around elliptical cross-sections (toggle with `W` key), matching MIPAV's `generateCurves()` / `generateEllipses()` algorithm
+- **Wireframe mesh**: Lattice-aligned rings (one per L/R pair) + 32 longitudinal splines (toggle with `W`), matching MIPAV's `displayContours[]` / `generateEllipses()` algorithm
 - **Surface mesh**: Solid triangle mesh rendered with smooth Phong shading and turbo colormap (toggle with `Shift+W`), matching MIPAV's `generateTriMesh()` — head/tail caps + body quads
+- **Cross-section ring editing**: Rings tab → "Enable ring editing" + Cmd+Click+Drag a wireframe ring vertex to reshape that cross-section radially. Four falloff modes (Single / Narrow / Medium / Wide) driven by the same Fourier kernel MIPAV uses (`precalculateCrossSectionBasis`, `LatticeModel.java:8352`). Overrides persist to `<results>/model_crossSections/latticeCrossSection_<i>.csv` (one file per edited ring, MIPAV-compatible) and reload automatically on next launch. Reset button wipes current-timepoint overrides.
 - **Arbitrary clip plane**: Per-timepoint arbitrary-orientation clipping with position and slab-thickness sliders. Shift+Drag on the canvas rotates the plane (MIPAV-style); red frame outline shows the clip slab. Volume ray-cast step size drops during drag for smooth interaction, then snaps back to full quality on release. Clips Image/Surface/Shapes/Points layers together.
 - **Dual-view navigation**: NEXT/BACK buttons (and `]`/`[`) advance the sliding-window pair with auto-save of annotations for currently displayed timepoints before moving — matches MIPAV's `PlugInDialogVolumeRenderDual` workflow.
 - **Threshold slider**: Global lower-contrast-limit slider in the layer-controls area, synced across both viewers and all channels. Non-destructive (adjusts contrast_limits, not data).
@@ -87,6 +88,7 @@ pixi run python napari_worm.py /path/to/RegB/ --no-grid
 | `Right` / `]` / NEXT button | Next timepoint pair (auto-saves current annotations first) |
 | `Left` / `[` / BACK button | Previous timepoint pair (auto-saves current annotations first) |
 | `Shift+Drag` on canvas | Rotate arbitrary clip plane (when clip is enabled) |
+| `Cmd+Click+Drag` on wireframe vertex | Reshape cross-section ring (requires Lattice + Wireframe + "Enable ring editing") |
 | `Cmd+Z` | Undo last annotation or lattice point |
 | Arrow keys | Nudge selected lattice point by 1 voxel |
 
@@ -97,6 +99,7 @@ Annotations and lattice data are saved per-timepoint in MIPAV-compatible CSV for
 ```
 RegB/Decon_reg_100/Decon_reg_100_results/integrated_annotation/annotations_test.csv
 RegB/Decon_reg_100/Decon_reg_100_results/lattice_final/lattice_test.csv
+RegB/Decon_reg_100/Decon_reg_100_results/model_crossSections/latticeCrossSection_<i>.csv
 ```
 
 ## Architecture
