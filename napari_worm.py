@@ -26,7 +26,7 @@ from dask import delayed
 from qtpy.QtCore import QEvent, QObject, Qt, QTimer
 from qtpy.QtGui import QKeySequence
 from qtpy.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout,
+    QApplication, QCheckBox, QComboBox, QFileDialog, QHBoxLayout,
     QHeaderView, QLabel, QMessageBox, QPushButton, QShortcut, QSlider,
     QSpinBox, QSplitter, QTabWidget, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget,
@@ -1382,101 +1382,6 @@ class HistogramLUTWidget(QWidget):
         self._redraw_histogram()
 
 
-class _Toast(QFrame):
-    """A single toast message. Transient ones auto-dismiss via QTimer;
-    persistent ones keep a close button until the user clicks it."""
-
-    def __init__(self, msg: str, parent, closable: bool):
-        super().__init__(parent)
-        self.setObjectName("napari_worm_toast")
-        # Distinct styling for persistent (has close button) vs transient
-        border = "#666" if closable else "#444"
-        bg = "#353535" if closable else "#2b2b2b"
-        self.setStyleSheet(f"""
-            QFrame#napari_worm_toast {{
-                background: {bg}; border: 1px solid {border};
-                border-radius: 4px;
-            }}
-            QLabel {{ color: #eee; }}
-            QPushButton {{
-                color: #bbb; background: transparent; border: none;
-                font-size: 14px; font-weight: bold;
-            }}
-            QPushButton:hover {{ color: #fff; }}
-        """)
-        h = QHBoxLayout(self)
-        h.setContentsMargins(10, 6, 6, 6)
-        h.setSpacing(6)
-        label = QLabel(msg)
-        label.setWordWrap(True)
-        label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        h.addWidget(label, stretch=1)
-        if closable:
-            btn = QPushButton("×")
-            btn.setFixedSize(20, 20)
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.clicked.connect(self.close)
-            h.addWidget(btn, alignment=Qt.AlignTop)
-
-
-class _ToastHost(QWidget):
-    """Bottom-right stacked notification overlay attached to a host window.
-
-    Owns two flavors of toast:
-      - transient: auto-dismiss after N ms (default 2.5s) — mode changes.
-      - persistent: close button, stays until the user clicks × — save paths,
-        errors, anything the user needs to read before it disappears.
-
-    Toasts stack vertically, newest on top. Resizing the host window
-    repositions the stack to keep it anchored to the bottom-right.
-    """
-
-    MARGIN = 16
-    MAX_WIDTH = 480
-
-    def __init__(self, host: QWidget):
-        super().__init__(host)
-        self._host = host
-        self._layout = QVBoxLayout(self)
-        self._layout.setContentsMargins(0, 0, 0, 0)
-        self._layout.setSpacing(6)
-        self._layout.setAlignment(Qt.AlignBottom | Qt.AlignRight)
-        self._host.installEventFilter(self)
-        self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
-        self.raise_()
-        self._reposition()
-
-    def eventFilter(self, obj, ev):
-        if obj is self._host and ev.type() in (QEvent.Resize, QEvent.Show):
-            self._reposition()
-        return False
-
-    def _reposition(self):
-        w = min(self.MAX_WIDTH, max(200, self._host.width() - 2 * self.MARGIN))
-        self.setFixedWidth(w)
-        self.adjustSize()
-        x = self._host.width() - w - self.MARGIN
-        y = self._host.height() - self.height() - self.MARGIN
-        self.move(x, max(self.MARGIN, y))
-        self.raise_()
-
-    def show_transient(self, msg: str, ms: int = 2500):
-        toast = _Toast(msg, self, closable=False)
-        self._append(toast)
-        QTimer.singleShot(ms, toast.deleteLater)
-
-    def show_persistent(self, msg: str):
-        toast = _Toast(msg, self, closable=True)
-        self._append(toast)
-
-    def _append(self, toast: _Toast):
-        self._layout.addWidget(toast)
-        toast.destroyed.connect(lambda *_: self._reposition())
-        self.show()
-        self._reposition()
-        self.raise_()
-
-
 class DualViewWindow:
     """Modifies viewer_left's native NapariQtMainWindow to host two independent
     canvases side-by-side with switchable left-side dock panels.
@@ -1523,11 +1428,6 @@ class DualViewWindow:
         vbox.addWidget(canvas_splitter, stretch=1)
         vbox.addWidget(nav_widget, stretch=0)
         self._host.setCentralWidget(central)
-
-        # Notification overlay: transient mode messages auto-dismiss, persistent
-        # save/error messages stay until the user closes them. Bypasses napari's
-        # own notification manager so we have uniform control over both.
-        self.toast_host = _ToastHost(self._host)
 
         # Per-viewer tab widgets inside dockLayerList:
         #   Tab 0 "Layers": existing layer list + histogram (as before)
@@ -1866,15 +1766,6 @@ class DualViewWindow:
 
     def setWindowTitle(self, title: str):
         self._host.setWindowTitle(title)
-
-    # ---- Notification helpers ------------------------------------------------
-    def toast(self, msg: str, ms: int = 2500):
-        """Short-lived toast for mode changes (Wireframe ON, LATTICE MODE, etc.)."""
-        self.toast_host.show_transient(msg, ms)
-
-    def toast_persistent(self, msg: str):
-        """Toast that stays until the user clicks × (save paths, errors, warnings)."""
-        self.toast_host.show_persistent(msg)
 
     def update_dock_titles(self, t_left: int, t_right: int):
         """Update dock tab labels to show timepoint numbers."""
@@ -2281,6 +2172,25 @@ class WormAnnotator:
 
         return nav
 
+    # ------------------------------------------------------------------ #
+    # Notification helpers — thin wrappers over napari's native toast       #
+    # system so multi-line messages get the compact "^" expand caret.       #
+    # Transient uses INFO severity (auto-dismiss); persistent uses WARNING  #
+    # severity which napari leaves up until the user dismisses it.          #
+    # ------------------------------------------------------------------ #
+    def _toast(self, msg: str, ms: int = 2500):
+        """Short-lived mode-change notification (napari auto-dismisses)."""
+        show_info(msg)
+
+    def _toast_persistent(self, msg: str):
+        """Sticky notification for save paths / errors. Uses WARNING severity
+        so napari doesn't auto-dismiss — user clicks × or ^ to expand."""
+        try:
+            from napari.utils.notifications import show_warning
+            show_warning(msg)
+        except Exception:
+            show_info(msg)
+
     def _show_help(self):
         """Show a floating help window with shortcuts and usage info."""
         # Reuse existing window if still open
@@ -2619,8 +2529,8 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
                                 lat_lc_ref, lat_rc_ref,
                                 pre_picked=picked, rings=rings, centers=centers)
                         else:
-                            show_info("Ring edit miss — click closer to a wireframe vertex "
-                                      "(or uncheck Enable ring editing to place lattice).")
+                            self._toast("Ring edit miss — click closer to a wireframe vertex "
+                                        "(or uncheck Enable ring editing to place lattice).")
                         return
 
                     peak = self._find_peak_multi_channel(near, far, side_idx)
@@ -3137,11 +3047,7 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
                     cb.blockSignals(True)
                     cb.setChecked(self.cross_section_edit_mode)
                     cb.blockSignals(False)
-        try:
-            from napari.utils.notifications import show_info
-            show_info(f"Ring editing: {'ON' if enabled else 'OFF'}")
-        except Exception:
-            pass
+        self._toast(f"Ring editing: {'ON' if enabled else 'OFF'}")
 
     def _on_cross_section_mode_changed(self, n_samples: int):
         """Mode button clicked → state. Mirror to both sides."""
@@ -3176,11 +3082,7 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
                 lat_rc    = self.lattice_right_curve_layers[side]
                 self._update_lattice_visuals(
                     lat_l, lat_r, lat_lines, lat_mid, lat_lc, lat_rc)
-            try:
-                from napari.utils.notifications import show_info
-                show_info("Cross-section rings reset (save to persist delete)")
-            except Exception:
-                pass
+            self._toast("Cross-section rings reset (save to persist delete)")
 
     def _load_cross_sections_for_timepoint(self, ti: int) -> int:
         """Read any latticeCrossSection_*.csv files for ti into
@@ -3722,12 +3624,12 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
             print("  D               → done with lattice")
             print("  L               → back to annotation mode")
             print("=" * 50)
-            show_info("LATTICE MODE")
+            self._toast("LATTICE MODE")
         else:
             print("=" * 50)
             print("  MODE: ANNOTATION  (Cmd+Click = annotate)")
             print("=" * 50)
-            show_info("ANNOTATION MODE")
+            self._toast("ANNOTATION MODE")
         # Sync GUI buttons
         if hasattr(self, 'dual_window'):
             self.dual_window._update_mode_buttons()
@@ -3764,7 +3666,7 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
                 print(f"[t={timepoint} {canvas_label}] {name}  "
                       f"z={pos[0]:.1f} y={pos[1]:.1f} x={pos[2]:.1f}  (next: R)")
                 if is_seam:
-                    show_info(f"Seam cell: {pair_names[-1]['name']}L")
+                    self._toast(f"Seam cell: {pair_names[-1]['name']}L")
                 self.lattice_undo_stack.append(('L', timepoint, lat_left_layer))
                 self.lattice_last_placed = {
                     'side_idx': side_idx, 'timepoint': timepoint,
@@ -3781,7 +3683,7 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
                 print(f"[t={timepoint} {canvas_label}] {name}  "
                       f"z={pos[0]:.1f} y={pos[1]:.1f} x={pos[2]:.1f}  (next: L)")
                 if pair_idx < len(pair_names) and pair_names[pair_idx]['type'] == 'seam':
-                    show_info(f"Seam cell: {name}")
+                    self._toast(f"Seam cell: {name}")
                 self.lattice_undo_stack.append(('R', timepoint, lat_right_layer))
                 self.lattice_last_placed = {
                     'side_idx': side_idx, 'timepoint': timepoint,
@@ -3845,7 +3747,7 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
             names_str = ', '.join(p['name'] for p in pair_names)
             print(f"  Renumbered: {names_str}")
             if is_seam:
-                show_info(f"Seam cell inserted: {inserted_name}")
+                self._toast(f"Seam cell inserted: {inserted_name}")
 
             self.lattice_undo_stack.append(('INSERT', timepoint,
                                             (lat_left_layer, lat_right_layer, idx)))
@@ -4016,7 +3918,7 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
         if saved:
             msg = f"Lattice saved for {saved} timepoint(s):\n" + "\n".join(saved_paths)
             print(msg)
-            show_info(msg)
+            self._toast_persistent(msg)
 
     def _save_current_timepoints(self):
         """Save annotations + lattice for the 2 currently displayed timepoints.
@@ -4082,7 +3984,7 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
         if saved_ts:
             msg = "Saved " + ", ".join(f"t={t}" for t in saved_ts)
             print(msg)
-            show_info(msg)
+            self._toast(msg)
 
     def _on_spinbox_changed(self):
         if self._nav_updating:
@@ -4396,7 +4298,7 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
                 wf.visible = self.wireframe_visible
         state = "ON" if self.wireframe_visible else "OFF"
         print(f"Wireframe: {state}")
-        show_info(f"Wireframe: {state}")
+        self._toast(f"Wireframe: {state}")
         if hasattr(self, 'dual_window') and self.dual_window is not None:
             self.dual_window._update_mode_buttons()
 
@@ -4419,12 +4321,12 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
             print("  Shift+W → toggle off")
             print("  Rendered with smooth shading, turbo colormap")
             print("=" * 50)
-            show_info("Surface: ON")
+            self._toast("Surface: ON")
         else:
             print("=" * 50)
             print("  SURFACE MESH: OFF")
             print("=" * 50)
-            show_info("Surface: OFF")
+            self._toast("Surface: OFF")
         if hasattr(self, 'dual_window') and self.dual_window is not None:
             self.dual_window._update_mode_buttons()
 
@@ -4455,7 +4357,7 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
             has_rings = bool(self.cross_section_overrides)
             if not (has_annotations or has_lattice or has_rings):
                 print("Nothing to save")
-                show_info("Nothing to save")
+                self._toast_persistent("Nothing to save")
                 return
             total = 0
             ann_paths = []
@@ -4475,17 +4377,18 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
                         print(f"  Saved {len(pts)} to {save_path}")
                 msg = f"Saved {total} annotations across {len(self.grid_annotations)} timepoint(s):\n" + "\n".join(ann_paths)
                 print(msg)
-                show_info(msg)
+                self._toast_persistent(msg)
             self._save_lattice()
         else:
             if not hasattr(self, 'points_layer') or len(self.points_layer.data) == 0:
                 print("No annotations to save")
-                show_info("No annotations to save")
+                self._toast_persistent("No annotations to save")
                 return
             save_path = (Path(self.annotations_path) if self.annotations_path
                          else self.volume_path.with_suffix('.csv'))
             save_annotations(self.points_layer.data, save_path)
-            show_info(f"Saved {len(self.points_layer.data)} annotations to {save_path}")
+            self._toast_persistent(
+                f"Saved {len(self.points_layer.data)} annotations to {save_path}")
 
     def run(self):
         napari.run()
