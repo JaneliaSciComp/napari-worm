@@ -206,10 +206,12 @@ def save_annotations(points, filepath, names=None, segments=None):
     """Save annotations in MIPAV format: name,x_voxels,y_voxels,z_voxels,R,G,B[,lattice_segment]"""
     filepath = Path(filepath)
     n = len(points)
+    # MIPAV-compatible 1-indexed naming (A1, A2, ...). Validated against
+    # straightened_annotations.csv from RW10752_NU/Decon_reg_15_results.
     if names is None:
-        names = [f"A{i}" for i in range(n)]
+        names = [f"A{i + 1}" for i in range(n)]
     elif len(names) < n:
-        names = list(names) + [f"A{i}" for i in range(len(names), n)]
+        names = list(names) + [f"A{i + 1}" for i in range(len(names), n)]
     df = pd.DataFrame({
         'name':     names,
         'x_voxels': points[:, 2],
@@ -2959,10 +2961,14 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
         csdir = self._cross_section_dir(ti)
         saved_paths = []
 
+        # MIPAV file naming is 1-indexed (latticeCrossSection_1.csv =
+        # first ring), validated against
+        # RW10752_NU/Decon_reg_15_results/model_crossSections (files 1..11,
+        # no _0). Our in-memory ring_idx is 0-based; map to 1-based on disk.
         if overrides:
             csdir.mkdir(parents=True, exist_ok=True)
             for ring_idx, offsets in overrides.items():
-                path = csdir / f"latticeCrossSection_{ring_idx}.csv"
+                path = csdir / f"latticeCrossSection_{ring_idx + 1}.csv"
                 if _save_cross_section_csv(path, offsets):
                     saved_paths.append(str(path))
 
@@ -2972,7 +2978,7 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
             import re
             for f in csdir.glob("latticeCrossSection_*.csv"):
                 m = re.match(r"latticeCrossSection_(\d+)\.csv", f.name)
-                if m and int(m.group(1)) not in overrides:
+                if m and (int(m.group(1)) - 1) not in overrides:
                     try:
                         f.unlink()
                     except OSError:
@@ -3092,13 +3098,17 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
         csdir = self._cross_section_dir(ti)
         if not csdir.exists():
             return 0
+        # MIPAV file naming is 1-indexed; map back to our 0-based ring_idx.
+        # Be tolerant of older napari-worm output that wrote 0-indexed files
+        # (latticeCrossSection_0.csv has never existed in MIPAV output).
         import re
         loaded = {}
         for f in csdir.glob("latticeCrossSection_*.csv"):
             m = re.match(r"latticeCrossSection_(\d+)\.csv", f.name)
             if not m:
                 continue
-            ring_idx = int(m.group(1))
+            file_idx = int(m.group(1))
+            ring_idx = file_idx - 1 if file_idx >= 1 else file_idx
             offsets = _load_cross_section_csv(f)
             if offsets is not None:
                 loaded[ring_idx] = offsets
@@ -3222,7 +3232,7 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
         if pts is not None:
             n = len(pts.data)
             if n > 0:
-                pts.properties = {'label': [f'A{i}' for i in range(n)]}
+                pts.properties = {'label': [f'A{i + 1}' for i in range(n)]}
                 pts.text = {**_text_style, 'string': 'label', 'color': 'white'}
             else:
                 pts.properties = {'label': []}
@@ -3278,7 +3288,7 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
         vol_shape = np.array(raw_vol.shape) if raw_vol is not None else None
         for i, (z, y, x) in enumerate(data):
             # Name — read-only
-            name_item = QTableWidgetItem(f"A{i}")
+            name_item = QTableWidgetItem(f"A{i + 1}")
             name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)
             table.setItem(i, 0, name_item)
             # X, Y, Z — editable
@@ -3471,7 +3481,7 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
             segs.pop(row)
         # Push undo
         self.undo_stack.append(('DELETE_ANN', ti, side, row, old_data[row].copy()))
-        print(f"[t={ti}] Deleted annotation A{row}")
+        print(f"[t={ti}] Deleted annotation A{row + 1}")
         self._refresh_annotation_table(side)
 
     def _delete_lattice_row(self, side: int):
@@ -4057,7 +4067,7 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
                 pts = pts_layer.data.copy()
                 pts[row] = old_val
                 pts_layer.data = pts
-                print(f"[t={ti}] Undid table edit on A{row}")
+                print(f"[t={ti}] Undid table edit on A{row + 1}")
                 self._refresh_tables()
             return
 
@@ -4070,7 +4080,7 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
                 pts_layer.data = np.insert(pts, row, old_val, axis=0)
                 segs = self.grid_annotation_segments.setdefault(ti, [])
                 segs.insert(row, -1)
-                print(f"[t={ti}] Undid delete of A{row}")
+                print(f"[t={ti}] Undid delete of A{row + 1}")
                 self._refresh_tables()
             return
 
