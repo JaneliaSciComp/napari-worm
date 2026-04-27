@@ -2098,6 +2098,7 @@ class WormAnnotator:
         self.preview_image_layers: list = [None, None]
         self.preview_points_layers: list = [None, None]
         self.preview_hidden_layers: list = [[], []]
+        self.preview_click_callbacks: list = [None, None]
 
         # Per-channel contrast limits — initialized lazily in _load_dual_pair
         # on first load to avoid redundant volume reads at startup
@@ -3209,11 +3210,12 @@ Auto-exits when timepoint changes. Powered by Caroline Malin-Mayor's
             blending='translucent', contrast_limits=list(contrast))
         self.preview_image_layers[side] = img
 
-        # Project existing twisted-space annotations into straightened space
-        # for visual reference (display only — edits go to the twisted layer).
+        # Project existing twisted-space annotations into straightened space.
+        # Always create the layer (even when empty) so click-time `add` can
+        # show a dot for points placed in preview mode.
         pts_layer = self.grid_points_layers[side]
+        proj = []
         if pts_layer is not None and len(pts_layer.data) > 0:
-            proj = []
             for p in pts_layer.data:
                 try:
                     coords = model.get_best_candidate(np.asarray(p))
@@ -3224,23 +3226,59 @@ Auto-exits when timepoint changes. Powered by Caroline Malin-Mayor's
                 ml_v, dv_v, ap_v = coords
                 ap_idx = float(np.interp(ap_v, ap_values, np.arange(len(ap_values))))
                 proj.append([ap_idx, dv_v + extent, ml_v + extent])
-            if proj:
-                ppts = viewer.add_points(
-                    np.asarray(proj), name='Annotations (straightened)',
-                    size=5, face_color='yellow', ndim=3)
-                self.preview_points_layers[side] = ppts
+        ppts = viewer.add_points(
+            np.asarray(proj) if proj else np.empty((0, 3)),
+            name='Annotations (straightened)',
+            size=10, face_color='yellow', border_color='red',
+            border_width=0.2, ndim=3, opacity=1.0)
+        # Text labels offset above each point — same trick the twisted-space
+        # layer uses so points buried inside bright nuclei stay findable.
+        n = len(ppts.data)
+        if n > 0:
+            ppts.properties = {'label': [f'P{i + 1}' for i in range(n)]}
+        else:
+            ppts.properties = {'label': []}
+        ppts.text = {
+            'string': 'label', 'color': 'yellow', 'size': 10,
+            'anchor': 'upper_left', 'translation': [0, 0, 15],
+        }
+        self.preview_points_layers[side] = ppts
 
-        # Click handler on the straightened image
+        # Click handler — register on every layer that could receive the click
+        # (the straightened image and the projection-points layer). Matches
+        # the multi-layer registration pattern used in _load_dual_pair.
         side_idx = side
-        @img.mouse_drag_callbacks.append
+
         def _preview_click_handler(layer, event):
             if 'Control' not in event.modifiers:
                 return
-            self._on_preview_click(side_idx, layer, event)
+            if not self.preview_mode_active[side_idx]:
+                return
+            preview_layer = self.preview_image_layers[side_idx]
+            if preview_layer is None:
+                return
+            self._on_preview_click(side_idx, preview_layer, event)
+
+        # Layer-level only — viewer-level was a fallback that ended up firing
+        # the same event twice. The layer-level callback fires reliably as
+        # long as the straightened image is selected (we set it above).
+        img.mouse_drag_callbacks.append(_preview_click_handler)
+        self.preview_click_callbacks[side] = _preview_click_handler
+
+        try:
+            viewer.layers.selection.active = img
+        except Exception:
+            pass
 
         self.preview_mode_active[side] = True
         self._update_preview_status(side)
         viewer.reset_view()
+        # Straightened volume is long+thin (AP ≫ ML/DV); reset_view zooms
+        # too tight to fit AP. Pull back so the whole tube is visible.
+        try:
+            viewer.camera.zoom *= 0.5
+        except Exception:
+            pass
         self._toast_persistent(
             f"Preview ON (side {'L' if side == 0 else 'R'} t={ti}): "
             f"AP={straight.shape[0]}, extent=±{extent}")
@@ -3248,6 +3286,17 @@ Auto-exits when timepoint changes. Powered by Caroline Malin-Mayor's
     def _exit_preview_mode(self, side: int):
         """Tear down straightened-volume display, restore twisted layers."""
         viewer = self.viewer_left if side == 0 else self.viewer_right
+
+        cb = self.preview_click_callbacks[side]
+        if cb is not None:
+            preview_layer = self.preview_image_layers[side]
+            if preview_layer is not None:
+                try:
+                    preview_layer.mouse_drag_callbacks.remove(cb)
+                except (ValueError, AttributeError):
+                    pass
+            self.preview_click_callbacks[side] = None
+
         for attr in ('preview_image_layers', 'preview_points_layers'):
             layer = getattr(self, attr)[side]
             if layer is not None:
@@ -3277,54 +3326,81 @@ Auto-exits when timepoint changes. Powered by Caroline Malin-Mayor's
 
     def _on_preview_click(self, side: int, layer, event):
         """Cmd+Click in straightened view → retwist → add to twisted points."""
+        # Dedupe: viewer-level + layer-level callbacks fire for the same click;
+        # tag the event so we only handle once.
+        if getattr(event, '_napari_worm_preview_handled', False):
+            return
+        try:
+            event._napari_worm_preview_handled = True
+        except Exception:
+            pass
+
         if not self.preview_mode_active[side]:
             return
         if self.lattice_mode or self.cross_section_edit_mode:
             self._toast("Preview mode is read-mostly — disable lattice/ring edit.")
             return
+
         try:
-            near, far = layer.get_ray_intersections(
-                event.position, event.view_direction, event.dims_displayed)
-        except Exception:
-            return
-        if near is None or far is None:
-            return
+            try:
+                near, far = layer.get_ray_intersections(
+                    event.position, event.view_direction, event.dims_displayed)
+            except Exception as exc:
+                print(f"[preview-click] ray_intersections raised: {exc}")
+                return
+            if near is None or far is None:
+                print(f"[preview-click] ray missed layer")
+                return
 
-        peak = find_peak_along_ray(layer.data, near, far)
-        pos_straight = find_nucleus_centroid(layer.data, peak)
+            print(f"[preview-click side={side}] ray near={near}, far={far}")
 
-        model = self.preview_models[side]
-        ap_values = self.preview_ap_values[side]
-        extent = self.preview_extents[side]
-        ap_idx = float(pos_straight[0])
-        dv_v = float(pos_straight[1]) - extent
-        ml_v = float(pos_straight[2]) - extent
-        # Linear interp into AP parameter space
-        i0 = int(np.floor(np.clip(ap_idx, 0, len(ap_values) - 1)))
-        i1 = min(i0 + 1, len(ap_values) - 1)
-        f = float(np.clip(ap_idx - i0, 0.0, 1.0))
-        ap_param = float((1 - f) * ap_values[i0] + f * ap_values[i1])
+            peak = find_peak_along_ray(layer.data, near, far)
+            print(f"  peak={peak}")
+            pos_straight = find_nucleus_centroid(layer.data, peak)
+            print(f"  pos_straight={pos_straight} (z=AP, y=DV-shifted, x=ML-shifted)")
 
-        twisted_pos = np.asarray(model.retwist(ml_v, dv_v, ap_param), dtype=float)
+            model = self.preview_models[side]
+            ap_values = self.preview_ap_values[side]
+            extent = self.preview_extents[side]
+            ap_idx = float(pos_straight[0])
+            dv_v = float(pos_straight[1]) - extent
+            ml_v = float(pos_straight[2]) - extent
 
-        # Add to the underlying twisted-space annotations (persists across toggle)
-        pts_layer = self.grid_points_layers[side]
-        if pts_layer is None:
-            return
-        pts_layer.add(twisted_pos)
-        ti = self.grid_timepoints[side]
-        segs = self.grid_annotation_segments.setdefault(ti, [])
-        segs.append(-1)
-        self.grid_annotations[ti] = pts_layer.data.copy()
-        self.undo_stack.append((ti, ('preview_add', pts_layer)))
+            i0 = int(np.floor(np.clip(ap_idx, 0, len(ap_values) - 1)))
+            i1 = min(i0 + 1, len(ap_values) - 1)
+            f = float(np.clip(ap_idx - i0, 0.0, 1.0))
+            ap_param = float((1 - f) * ap_values[i0] + f * ap_values[i1])
+            print(f"  worm-coords: ml={ml_v:.2f} dv={dv_v:.2f} ap_param={ap_param:.3f}")
 
-        # Also add to the straightened-space display layer for immediate feedback
-        ppts = self.preview_points_layers[side]
-        if ppts is not None:
-            ppts.add(np.asarray(pos_straight, dtype=float))
+            twisted_pos = np.asarray(model.retwist(ml_v, dv_v, ap_param), dtype=float)
+            print(f"  twisted_pos (z,y,x) = {twisted_pos}")
 
-        self._refresh_annotation_table(side)
-        self._refresh_point_labels(side)
+            pts_layer = self.grid_points_layers[side]
+            if pts_layer is None:
+                print("  [skip] grid_points_layers[side] is None")
+                return
+            pts_layer.add(twisted_pos)
+            ti = self.grid_timepoints[side]
+            segs = self.grid_annotation_segments.setdefault(ti, [])
+            segs.append(-1)
+            self.grid_annotations[ti] = pts_layer.data.copy()
+            self.undo_stack.append((ti, ('preview_add', pts_layer)))
+
+            ppts = self.preview_points_layers[side]
+            if ppts is not None:
+                ppts.add(np.asarray(pos_straight, dtype=float))
+                n = len(ppts.data)
+                ppts.properties = {'label': [f'P{i + 1}' for i in range(n)]}
+                print(f"  preview layer points: {n}, "
+                      f"visible={ppts.visible}, last={ppts.data[-1]}")
+
+            self._refresh_annotation_table(side)
+            self._refresh_point_labels(side)
+            print(f"  [ok] annotation #{len(pts_layer.data)} added at t={ti}")
+        except Exception as exc:
+            import traceback
+            print(f"[preview-click] EXCEPTION: {exc}")
+            traceback.print_exc()
 
     def _reset_preview_checkbox(self, side: int):
         """Uncheck the preview checkbox without re-triggering the toggle."""
