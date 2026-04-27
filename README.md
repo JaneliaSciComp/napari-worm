@@ -23,7 +23,8 @@ Developed at the **Shroff Lab**, Janelia Research Campus.
 - **Arbitrary clip plane**: Per-timepoint arbitrary-orientation clipping with position and slab-thickness sliders. Shift+Drag on the canvas rotates the plane (MIPAV-style); red frame outline shows the clip slab. Volume ray-cast step size drops during drag for smooth interaction, then snaps back to full quality on release. Clips Image/Surface/Shapes/Points layers together.
 - **Dual-view navigation**: NEXT/BACK buttons (and `]`/`[`) advance the sliding-window pair with auto-save of annotations for currently displayed timepoints before moving — matches MIPAV's `PlugInDialogVolumeRenderDual` workflow.
 - **Threshold slider**: Global lower-contrast-limit slider in the layer-controls area, synced across both viewers and all channels. Non-destructive (adjusts contrast_limits, not data).
-- **MIPAV-compatible output**: Saves `annotations_test.csv` and `lattice_test.csv` per timepoint in the expected directory structure
+- **Preview mode (straightening)**: Preview tab → "Enable straightened view" resamples the twisted volume into a straightened tube using the lattice. Output axes are `Z=AP` (head→tail), `Y=DV`, `X=ML`. Cmd+Click in this view places annotations; positions are mapped back to twisted-pixel space via retwist so they persist when preview toggles off and save in the original coordinate system. Auto-exits on timepoint change. All worm-space math (splines, basis vectors, `straighten_volume`, `retwist`) runs in [Caroline Malin-Mayor's `celegans_model` package](https://github.com/ShroffLab/pyShroffCelegansModels) — napari-worm is a UI shell on top.
+- **MIPAV-compatible output**: Saves per-timepoint with 1-indexed naming matching MIPAV exactly: annotations as `A1, A2, ...` in `annotations_test.csv`, lattice in `lattice_test.csv`, cross-section overrides as `latticeCrossSection_1.csv` through `latticeCrossSection_<n>.csv` (no `_0`).
 - **Toast notifications**: In-app notifications for save confirmations, mode changes, and seam cell placement
 
 ## Quick Install (one command)
@@ -107,7 +108,13 @@ RegB/Decon_reg_100/Decon_reg_100_results/model_crossSections/latticeCrossSection
 Single-file tool (`napari_worm.py`) built on Napari's viewer API:
 
 - `DualViewWindow` — Two independent `QtViewer` canvases in a `QSplitter`, with tabified dock widgets for panel switching
-- `WormAnnotator` — Main class handling annotation, lattice, wireframe, and surface state
+- `WormAnnotator` — Main class handling annotation, lattice, wireframe, surface, and preview state
 - `generate_wireframe_mesh()` — Builds 32 longitudinal splines from lattice L/R pairs using orthogonal frame construction (tangent from center spline derivative, right vector from L-to-R direction, up from cross product)
 - `generate_surface_mesh()` — Converts ellipse cross-sections into a triangle mesh `(vertices, faces, values)` for napari's `add_surface()`, matching MIPAV's `generateTriMesh()` vertex layout and face indexing
+- `_make_celegans_model()` — Adapter that converts napari's `(N, 3)` (z,y,x) lattice arrays into Caroline's `(N, 2, 3)` `PythonCelegansModel`. Preview mode delegates `straighten_volume` and `retwist` to that model.
+
+## Dependencies
+
+- `napari`, `pyqt`, `numpy`, `pandas`, `tifffile`, `zarr`, `dask`, `scipy`, `pyqtgraph`, `superqt` (via `pixi.toml`)
+- [`celegans-model`](https://github.com/ShroffLab/pyShroffCelegansModels) (Caroline Malin-Mayor / Funke Lab, BSD-3) — worm-space coordinate transforms used by Preview mode. Installed as a Python dep.
 
