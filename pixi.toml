@@ -20,3 +20,13 @@ ipykernel = ">=6.31.0,<7"
 pyqtgraph = ">=0.13"
 superqt = ">=0.6"
 pixi-pack = ">=0.7.6,<0.8"
+scipy = ">=1.10"
+pip = "*"
+
+[pypi-dependencies]
+# Caroline Malin-Mayor's worm-space coordinate-transform package
+# (lattice splines, basis vectors, pixel→(ML,DV,AP), retwist, straighten_volume).
+# Pinned to dchen116's PR branch (add-straighten-retwist) until
+# ShroffLab/pyShroffCelegansModels#3 merges; afterwards swap the URL
+# to ShroffLab and drop the branch arg (one-line change).
+celegans-model = { git = "https://github.com/dchen116/pyShroffCelegansModels.git", branch = "add-straighten-retwist", extras = ["python"] }

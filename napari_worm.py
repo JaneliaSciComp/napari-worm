@@ -23,6 +23,11 @@ import pandas as pd
 import tifffile
 from scipy.interpolate import CubicSpline
 from dask import delayed
+# Caroline Malin-Mayor's worm-space coordinate-transform package.
+# Provides PythonCelegansModel.{straighten_volume, retwist, get_basis_vectors,
+# get_best_candidate}. We delegate all (ML, DV, AP) coordinate math to this
+# package; napari-worm is a UI shell that drives it.
+from celegans_model import PythonCelegansModel
 from qtpy.QtCore import QEvent, QObject, Qt, QTimer
 from qtpy.QtGui import QKeySequence
 from qtpy.QtWidgets import (
@@ -858,6 +863,38 @@ def generate_surface_mesh(left_pts: np.ndarray, right_pts: np.ndarray,
     values[-1] = 1.0  # tail center
 
     return vertices, faces, values
+
+
+def _make_celegans_model(left_pts_zyx: np.ndarray, right_pts_zyx: np.ndarray,
+                         names: list[str] | None = None) -> PythonCelegansModel | None:
+    """Build a PythonCelegansModel from napari-worm lattice arrays.
+
+    napari-worm stores lattice points as (N, 3) (z, y, x) arrays. Caroline's
+    PythonCelegansModel takes a (N, 2, 3) array where ``[:, 0]=right`` and
+    ``[:, 1]=left``. Coordinate convention is consistent within a single
+    model instance, so we keep (z, y, x) end-to-end — model splines, retwist
+    output, and straighten_volume input all live in (z, y, x).
+
+    `names` are pair base-names like ``a0``, ``H0``, ``H1``, ... If they match
+    the canonical 11 standard cells in the standard order we use
+    `parameterization='uniform'`; otherwise we fall back to `'arc_length'`
+    (which doesn't require canonical names).
+
+    Returns None if there are fewer than 3 paired lattice points.
+    """
+    n = min(len(left_pts_zyx), len(right_pts_zyx))
+    if n < 3:
+        return None
+    lattice = np.stack([right_pts_zyx[:n], left_pts_zyx[:n]], axis=1).astype(float)
+    standard = ['a0', 'h0', 'h1', 'h2', 'v1', 'v2', 'v3', 'v4', 'v5', 'v6', 't']
+    if names is not None:
+        names_lower = [str(s).lower() for s in names[:n]]
+        if names_lower == standard[:n]:
+            return PythonCelegansModel(
+                lattice, parameterization='uniform', spacing=1.0,
+                lattice_point_names=names_lower)
+    # Fallback: arc-length parameterization works without canonical names.
+    return PythonCelegansModel(lattice, parameterization='arc_length')
 
 
 def load_annotations(filepath):
@@ -1711,12 +1748,53 @@ class DualViewWindow:
             cs_enable.toggled.connect(
                 lambda v: self._annotator._on_cross_section_enable_changed(v))
 
-            # Assemble Layers/Tables/Clip/Rings tabs
+            # --- Preview tab: straightened-volume rendering (MIPAV previewMode) ---
+            preview_tab = QWidget()
+            preview_layout = QVBoxLayout(preview_tab)
+            preview_layout.setContentsMargins(8, 8, 8, 8)
+            preview_layout.setSpacing(6)
+
+            preview_title = QLabel("<b>Preview mode (straightening)</b>")
+            preview_layout.addWidget(preview_title)
+
+            preview_enable = QCheckBox("Enable straightened view")
+            preview_layout.addWidget(preview_enable)
+
+            preview_info = QLabel("Status: off")
+            preview_info.setStyleSheet("color: #888; font-size: 10px;")
+            preview_info.setWordWrap(True)
+            preview_layout.addWidget(preview_info)
+
+            preview_hint = QLabel(
+                "Requires lattice with ≥3 pairs. Straightened axes: "
+                "Z=AP (head→tail), Y=DV, X=ML. Cmd+Click in this view "
+                "places an annotation; the position is retwisted to the "
+                "twisted volume so it persists when preview is toggled "
+                "off. Lattice + ring editing are disabled while preview "
+                "is on. Powered by Caroline Malin-Mayor's "
+                "<code>celegans_model</code> package "
+                "(<code>PythonCelegansModel.straighten_volume</code> + "
+                "<code>retwist</code>).")
+            preview_hint.setStyleSheet("color: #888; font-size: 10px;")
+            preview_hint.setWordWrap(True)
+            preview_layout.addWidget(preview_hint)
+            preview_layout.addStretch()
+
+            if not hasattr(self, '_preview_controls'):
+                self._preview_controls = [None, None]
+            self._preview_controls[side] = {
+                'enable': preview_enable, 'info': preview_info}
+
+            preview_enable.toggled.connect(
+                lambda v, s=side: self._annotator._on_preview_toggle(s, v))
+
+            # Assemble Layers/Tables/Clip/Rings/Preview tabs
             tab_widget = QTabWidget()
             tab_widget.addTab(layers_tab, "Layers")
             tab_widget.addTab(tables_tab, "Tables")
             tab_widget.addTab(clip_tab, "Clip")
             tab_widget.addTab(edit_tab, "Rings")
+            tab_widget.addTab(preview_tab, "Preview")
             combined.addWidget(tab_widget)
 
             # Put combined layout into the dock
@@ -2012,6 +2090,15 @@ class WormAnnotator:
         self.lattice_seam_counter: dict[int, list[str]] = {}  # {timepoint: [used seam names]}
         self.lattice_undo_stack: list = []  # ('L'|'R', timepoint, layer)
 
+        # Preview-mode state (per side) — see _enter_preview_mode.
+        self.preview_mode_active: list[bool] = [False, False]
+        self.preview_models: list = [None, None]
+        self.preview_ap_values: list = [None, None]
+        self.preview_extents: list = [None, None]
+        self.preview_image_layers: list = [None, None]
+        self.preview_points_layers: list = [None, None]
+        self.preview_hidden_layers: list = [[], []]
+
         # Per-channel contrast limits — initialized lazily in _load_dual_pair
         # on first load to avoid redundant volume reads at startup
         self.channel_contrast_limits: dict[str, list[float]] = {}
@@ -2286,6 +2373,18 @@ Save with <b>S</b> or <b>Save All</b>.
 Clip state is remembered per timepoint — each timepoint can have its own plane.
 </p>
 
+<h3>Preview (Preview tab)</h3>
+<table cellpadding="4">
+<tr><td><b>Enable straightened view</b></td><td>Replaces the twisted volume with a straightened tube; Z=AP, Y=DV, X=ML</td></tr>
+<tr><td><b>Cmd+Click</b></td><td>Place an annotation in straightened space; retwisted to twisted volume so it persists when preview toggles off</td></tr>
+</table>
+<p style="font-size: 11px; color: #888; margin-left: 4px;">
+Requires lattice with ≥3 pairs. Lattice + ring editing are disabled while preview is on.
+Auto-exits when timepoint changes. Powered by Caroline Malin-Mayor's
+<code>celegans_model</code> package — straighten + retwist run via
+<code>PythonCelegansModel</code>.
+</p>
+
 <h3>Tips</h3>
 <ul>
 <li>Click on either canvas to switch the left panel to that viewer's controls</li>
@@ -2367,6 +2466,13 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
         """Load two timepoints into their respective viewers."""
         self._save_grid_annotations_to_cache()
         self._save_lattice_to_cache()
+
+        # Auto-exit preview mode — its straightened volume + retwist frames
+        # are tied to the current timepoint's lattice and would be stale.
+        for side in (0, 1):
+            if self.preview_mode_active[side]:
+                self._reset_preview_checkbox(side)
+                self._exit_preview_mode(side)
 
         self.viewer_left.layers.clear()
         self.viewer_right.layers.clear()
@@ -3040,6 +3146,212 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
             lat_l_ref, lat_r_ref, lat_lines_ref,
             lat_mid_ref, lat_lc_ref, lat_rc_ref)
         print(f"[ring-edit t={timepoint}] Released ring {ring_idx}")
+
+    def _on_preview_toggle(self, side: int, enabled: bool):
+        """UI checkbox → enter/exit preview mode for one side."""
+        if enabled:
+            self._enter_preview_mode(side)
+        else:
+            self._exit_preview_mode(side)
+
+    def _enter_preview_mode(self, side: int):
+        """Build straightened volume for `side`, swap layers."""
+        lat_l = self.lattice_left_layers[side]
+        lat_r = self.lattice_right_layers[side]
+        if lat_l is None or lat_r is None:
+            self._toast_persistent("Preview: no lattice layer for this side.")
+            self._reset_preview_checkbox(side)
+            return
+        left_pts = np.asarray(lat_l.data)
+        right_pts = np.asarray(lat_r.data)
+        n = min(len(left_pts), len(right_pts))
+        if n < 3:
+            self._toast_persistent(
+                f"Preview: need ≥3 lattice pairs (have {n}).")
+            self._reset_preview_checkbox(side)
+            return
+
+        ti = self.grid_timepoints[side]
+        pair_names = self.lattice_pair_names.get(ti, [])
+        names = [p['name'] for p in pair_names[:n]] if pair_names else None
+
+        try:
+            model = _make_celegans_model(left_pts, right_pts, names)
+            if model is None:
+                raise ValueError("model construction returned None")
+            volume = self._get_blended_volume(side)
+            self._toast(f"Building straightened volume…")
+            QApplication.processEvents()
+            straight, ap_values = model.straighten_volume(volume.astype(np.float32))
+        except Exception as exc:
+            import traceback; traceback.print_exc()
+            self._toast_persistent(f"Preview: straighten failed — {exc}")
+            self._reset_preview_checkbox(side)
+            return
+
+        extent = (straight.shape[1] - 1) // 2
+        self.preview_models[side] = model
+        self.preview_ap_values[side] = ap_values
+        self.preview_extents[side] = extent
+
+        viewer = self.viewer_left if side == 0 else self.viewer_right
+        hidden = []
+        for layer in viewer.layers:
+            if layer.visible:
+                hidden.append(layer)
+                layer.visible = False
+        self.preview_hidden_layers[side] = hidden
+
+        contrast = (float(np.percentile(straight, 1.0)),
+                    float(np.percentile(straight, 99.5)))
+        img = viewer.add_image(
+            straight, name=f'Straightened t={ti}', colormap='gray',
+            blending='translucent', contrast_limits=list(contrast))
+        self.preview_image_layers[side] = img
+
+        # Project existing twisted-space annotations into straightened space
+        # for visual reference (display only — edits go to the twisted layer).
+        pts_layer = self.grid_points_layers[side]
+        if pts_layer is not None and len(pts_layer.data) > 0:
+            proj = []
+            for p in pts_layer.data:
+                try:
+                    coords = model.get_best_candidate(np.asarray(p))
+                except Exception:
+                    coords = None
+                if coords is None:
+                    continue
+                ml_v, dv_v, ap_v = coords
+                ap_idx = float(np.interp(ap_v, ap_values, np.arange(len(ap_values))))
+                proj.append([ap_idx, dv_v + extent, ml_v + extent])
+            if proj:
+                ppts = viewer.add_points(
+                    np.asarray(proj), name='Annotations (straightened)',
+                    size=5, face_color='yellow', ndim=3)
+                self.preview_points_layers[side] = ppts
+
+        # Click handler on the straightened image
+        side_idx = side
+        @img.mouse_drag_callbacks.append
+        def _preview_click_handler(layer, event):
+            if 'Control' not in event.modifiers:
+                return
+            self._on_preview_click(side_idx, layer, event)
+
+        self.preview_mode_active[side] = True
+        self._update_preview_status(side)
+        viewer.reset_view()
+        self._toast_persistent(
+            f"Preview ON (side {'L' if side == 0 else 'R'} t={ti}): "
+            f"AP={straight.shape[0]}, extent=±{extent}")
+
+    def _exit_preview_mode(self, side: int):
+        """Tear down straightened-volume display, restore twisted layers."""
+        viewer = self.viewer_left if side == 0 else self.viewer_right
+        for attr in ('preview_image_layers', 'preview_points_layers'):
+            layer = getattr(self, attr)[side]
+            if layer is not None:
+                try:
+                    if layer in viewer.layers:
+                        viewer.layers.remove(layer)
+                except Exception:
+                    pass
+            getattr(self, attr)[side] = None
+
+        for layer in self.preview_hidden_layers[side]:
+            try:
+                layer.visible = True
+            except Exception:
+                pass
+        self.preview_hidden_layers[side] = []
+
+        self.preview_models[side] = None
+        self.preview_ap_values[side] = None
+        self.preview_extents[side] = None
+        self.preview_mode_active[side] = False
+        self._update_preview_status(side)
+        try:
+            viewer.reset_view()
+        except Exception:
+            pass
+
+    def _on_preview_click(self, side: int, layer, event):
+        """Cmd+Click in straightened view → retwist → add to twisted points."""
+        if not self.preview_mode_active[side]:
+            return
+        if self.lattice_mode or self.cross_section_edit_mode:
+            self._toast("Preview mode is read-mostly — disable lattice/ring edit.")
+            return
+        try:
+            near, far = layer.get_ray_intersections(
+                event.position, event.view_direction, event.dims_displayed)
+        except Exception:
+            return
+        if near is None or far is None:
+            return
+
+        peak = find_peak_along_ray(layer.data, near, far)
+        pos_straight = find_nucleus_centroid(layer.data, peak)
+
+        model = self.preview_models[side]
+        ap_values = self.preview_ap_values[side]
+        extent = self.preview_extents[side]
+        ap_idx = float(pos_straight[0])
+        dv_v = float(pos_straight[1]) - extent
+        ml_v = float(pos_straight[2]) - extent
+        # Linear interp into AP parameter space
+        i0 = int(np.floor(np.clip(ap_idx, 0, len(ap_values) - 1)))
+        i1 = min(i0 + 1, len(ap_values) - 1)
+        f = float(np.clip(ap_idx - i0, 0.0, 1.0))
+        ap_param = float((1 - f) * ap_values[i0] + f * ap_values[i1])
+
+        twisted_pos = np.asarray(model.retwist(ml_v, dv_v, ap_param), dtype=float)
+
+        # Add to the underlying twisted-space annotations (persists across toggle)
+        pts_layer = self.grid_points_layers[side]
+        if pts_layer is None:
+            return
+        pts_layer.add(twisted_pos)
+        ti = self.grid_timepoints[side]
+        segs = self.grid_annotation_segments.setdefault(ti, [])
+        segs.append(-1)
+        self.grid_annotations[ti] = pts_layer.data.copy()
+        self.undo_stack.append((ti, ('preview_add', pts_layer)))
+
+        # Also add to the straightened-space display layer for immediate feedback
+        ppts = self.preview_points_layers[side]
+        if ppts is not None:
+            ppts.add(np.asarray(pos_straight, dtype=float))
+
+        self._refresh_annotation_table(side)
+        self._refresh_point_labels(side)
+
+    def _reset_preview_checkbox(self, side: int):
+        """Uncheck the preview checkbox without re-triggering the toggle."""
+        if not hasattr(self.dual_window, '_preview_controls'):
+            return
+        ctrls = self.dual_window._preview_controls[side]
+        if ctrls is None:
+            return
+        cb = ctrls['enable']
+        cb.blockSignals(True)
+        cb.setChecked(False)
+        cb.blockSignals(False)
+        self._update_preview_status(side)
+
+    def _update_preview_status(self, side: int):
+        """Refresh the 'Status: …' label in the Preview tab."""
+        if not hasattr(self.dual_window, '_preview_controls'):
+            return
+        ctrls = self.dual_window._preview_controls[side]
+        if ctrls is None:
+            return
+        if self.preview_mode_active[side]:
+            n_ap = len(self.preview_ap_values[side]) if self.preview_ap_values[side] is not None else 0
+            ext = self.preview_extents[side] or 0
+            ctrls['info'].setText(f"Status: ON · AP={n_ap}, extent=±{ext}")
+        else:
+            ctrls['info'].setText("Status: off")
 
     def _on_cross_section_enable_changed(self, enabled: bool):
         """UI checkbox → state. Mirror to both sides' checkboxes."""
