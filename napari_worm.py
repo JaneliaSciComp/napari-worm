@@ -2097,6 +2097,7 @@ class WormAnnotator:
         self.preview_extents: list = [None, None]
         self.preview_image_layers: list = [None, None]
         self.preview_points_layers: list = [None, None]
+        self.preview_overlay_layers: list = [[], []]   # midline + lattice splines per side
         self.preview_hidden_layers: list = [[], []]
         self.preview_click_callbacks: list = [None, None]
 
@@ -3157,6 +3158,11 @@ Auto-exits when timepoint changes. Powered by Caroline Malin-Mayor's
 
     def _enter_preview_mode(self, side: int):
         """Build straightened volume for `side`, swap layers."""
+        # Idempotent: if already active, do nothing. Re-entering would
+        # overwrite preview_hidden_layers (= original twisted layers) with
+        # the previous preview's own layers, which leaks the originals.
+        if self.preview_mode_active[side]:
+            return
         lat_l = self.lattice_left_layers[side]
         lat_r = self.lattice_right_layers[side]
         if lat_l is None or lat_r is None:
@@ -3209,6 +3215,68 @@ Auto-exits when timepoint changes. Powered by Caroline Malin-Mayor's
             straight, name=f'Straightened t={ti}', colormap='gray',
             blending='translucent', contrast_limits=list(contrast))
         self.preview_image_layers[side] = img
+
+        # Project the lattice splines (L, R, center) into straightened space
+        # so the user has the same midline + lattice overlays they're used to
+        # in the twisted view. Each lattice point becomes (ap_idx, dv+e, ml+e)
+        # in the straightened frame; in straightened space ML/DV are pure
+        # linear projections, so the splines render as nearly-straight lines
+        # along Z (AP) at the worm's midline.
+        overlays = []
+        try:
+            ap_dense = np.linspace(*model.internal_range, num=200)
+            center_pts = model.center_spline.interpolate(ap_dense)
+            left_pts_spline = model.left_spline.interpolate(ap_dense)
+            right_pts_spline = model.right_spline.interpolate(ap_dense)
+            ap_idx_dense = np.interp(ap_dense, ap_values,
+                                     np.arange(len(ap_values)))
+
+            def _project(world_pts):
+                proj = np.empty((len(world_pts), 3))
+                for i, (p, ap_i) in enumerate(zip(world_pts, ap_idx_dense)):
+                    delta = p - center_pts[i]
+                    ml_b, dv_b, _ = model.get_basis_vectors(float(ap_dense[i]))
+                    ml = float(np.dot(delta, ml_b))
+                    dv = float(np.dot(delta, dv_b))
+                    proj[i] = [ap_i, dv + extent, ml + extent]
+                return proj
+
+            center_proj = _project(center_pts)
+            left_proj = _project(left_pts_spline)
+            right_proj = _project(right_pts_spline)
+
+            mid_layer = viewer.add_shapes(
+                [center_proj], shape_type='path', edge_color='red',
+                edge_width=1.5, name='Midline (straightened)', opacity=0.9)
+            left_layer = viewer.add_shapes(
+                [left_proj], shape_type='path', edge_color='magenta',
+                edge_width=1.0, name='Left spline (straightened)', opacity=0.9)
+            right_layer = viewer.add_shapes(
+                [right_proj], shape_type='path', edge_color='green',
+                edge_width=1.0, name='Right spline (straightened)', opacity=0.9)
+            overlays = [mid_layer, left_layer, right_layer]
+
+            # Also overlay the lattice control points so the user sees the
+            # H0/H1/V1.. structure laid out along AP.
+            n_lat = min(len(left_pts), len(right_pts))
+            lat_proj_pts = []
+            for i in range(n_lat):
+                for p in (left_pts[i], right_pts[i]):
+                    cands = model.get_best_candidate(np.asarray(p))
+                    if cands is None:
+                        continue
+                    ml_v, dv_v, ap_v = cands
+                    ap_i = float(np.interp(ap_v, ap_values,
+                                           np.arange(len(ap_values))))
+                    lat_proj_pts.append([ap_i, dv_v + extent, ml_v + extent])
+            if lat_proj_pts:
+                lat_layer = viewer.add_points(
+                    np.asarray(lat_proj_pts), name='Lattice (straightened)',
+                    size=8, face_color='cyan', border_color='black',
+                    border_width=0.15, ndim=3, opacity=0.9)
+                overlays.append(lat_layer)
+        except Exception as exc:
+            print(f"[preview] overlay projection skipped: {exc}")
 
         # Project existing twisted-space annotations into straightened space.
         # Always create the layer (even when empty) so click-time `add` can
@@ -3270,21 +3338,61 @@ Auto-exits when timepoint changes. Powered by Caroline Malin-Mayor's
         except Exception:
             pass
 
+        # Custom AP/DV/ML axis triad pinned to the volume's near-corner. napari's
+        # built-in axes indicator renders labels too small to read; a Shapes
+        # layer + Points-with-text gives full control over size and placement.
+        try:
+            arrow_len = max(20.0, extent * 0.5)
+            origin = np.array([0.0, 2.0 * extent, 0.0])  # bottom-front corner
+            ap_tip = origin + np.array([arrow_len, 0.0, 0.0])  # along AP (axis 0)
+            dv_tip = origin + np.array([0.0, -arrow_len, 0.0])  # along DV up
+            ml_tip = origin + np.array([0.0, 0.0, arrow_len])  # along ML
+            tri_layer = viewer.add_shapes(
+                [np.array([origin, ap_tip]),
+                 np.array([origin, dv_tip]),
+                 np.array([origin, ml_tip])],
+                shape_type='line',
+                edge_color=['red', 'green', 'blue'],
+                edge_width=2.5, name='Axes triad', opacity=1.0)
+            tri_lbl = viewer.add_points(
+                np.array([
+                    ap_tip + np.array([6, 0, 0]),
+                    dv_tip + np.array([0, -6, 0]),
+                    ml_tip + np.array([0, 0, 6]),
+                ]),
+                name='Axes labels', size=0.5, face_color='transparent',
+                properties={'label': ['AP', 'DV', 'ML']},
+                text={'string': 'label', 'color': 'white', 'size': 14,
+                      'anchor': 'center'},
+                ndim=3, opacity=1.0)
+            overlays.extend([tri_layer, tri_lbl])
+            viewer.scale_bar.visible = True
+            viewer.scale_bar.unit = 'voxel'
+        except Exception as exc:
+            print(f"[preview] axis triad skipped: {exc}")
+        self.preview_overlay_layers[side] = overlays
+
         self.preview_mode_active[side] = True
         self._update_preview_status(side)
         viewer.reset_view()
-        # Straightened volume is long+thin (AP ≫ ML/DV); reset_view zooms
-        # too tight to fit AP. Pull back so the whole tube is visible.
+        # Default view: AP axis runs horizontal across screen, DV vertical,
+        # ML into/out of screen. Camera looks along ML (axis 2 = napari x).
+        # set_view_direction takes (z, y, x) world-coord vectors.
         try:
+            viewer.camera.set_view_direction(
+                view_direction=(0.0, 0.0, 1.0),   # look along +ML
+                up_direction=(0.0, 1.0, 0.0),     # DV is up; AP becomes horizontal
+            )
             viewer.camera.zoom *= 0.5
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[preview] camera setup skipped: {exc}")
         self._toast_persistent(
             f"Preview ON (side {'L' if side == 0 else 'R'} t={ti}): "
             f"AP={straight.shape[0]}, extent=±{extent}")
 
     def _exit_preview_mode(self, side: int):
         """Tear down straightened-volume display, restore twisted layers."""
+        print(f"[preview] _exit_preview_mode(side={side}) called")
         viewer = self.viewer_left if side == 0 else self.viewer_right
 
         cb = self.preview_click_callbacks[side]
@@ -3307,6 +3415,14 @@ Auto-exits when timepoint changes. Powered by Caroline Malin-Mayor's
                     pass
             getattr(self, attr)[side] = None
 
+        for layer in self.preview_overlay_layers[side]:
+            try:
+                if layer in viewer.layers:
+                    viewer.layers.remove(layer)
+            except Exception:
+                pass
+        self.preview_overlay_layers[side] = []
+
         for layer in self.preview_hidden_layers[side]:
             try:
                 layer.visible = True
@@ -3319,10 +3435,33 @@ Auto-exits when timepoint changes. Powered by Caroline Malin-Mayor's
         self.preview_extents[side] = None
         self.preview_mode_active[side] = False
         self._update_preview_status(side)
+
+        # Restore active layer selection — preview set selection.active to
+        # the (now-removed) straightened image layer; if we don't reset it,
+        # click routing for ring editing on the wireframe layer can break.
+        try:
+            img_layers = self.grid_image_layers[side]
+            primary = (img_layers[0] if isinstance(img_layers, list)
+                       else img_layers)
+            if primary is not None:
+                viewer.layers.selection.active = primary
+        except Exception:
+            pass
+
+        # Restore default axis labels and hide preview-only indicators.
+        try:
+            viewer.axes.visible = False
+            viewer.scale_bar.visible = False
+            viewer.dims.axis_labels = ('z', 'y', 'x')
+        except Exception:
+            pass
+
         try:
             viewer.reset_view()
         except Exception:
             pass
+        print(f"[preview] _exit done — viewer has {len(viewer.layers)} layers, "
+              f"active={viewer.layers.selection.active.name if viewer.layers.selection.active else None}")
 
     def _on_preview_click(self, side: int, layer, event):
         """Cmd+Click in straightened view → retwist → add to twisted points."""
