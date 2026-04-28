@@ -39,6 +39,17 @@ from qtpy.QtWidgets import (
 import pyqtgraph as pg
 
 
+# Register 'voxel' as a pint alias so napari's scale-bar overlay can parse
+# it when re-created on subsequent add_image calls (else UndefinedUnitError).
+try:
+    import pint as _pint
+    _ureg = _pint.get_application_registry()
+    if 'voxel' not in _ureg:
+        _ureg.define('voxel = pixel')
+except Exception:
+    pass
+
+
 # ---------------------------------------------------------------------------
 # Data loading helpers
 # ---------------------------------------------------------------------------
@@ -315,6 +326,50 @@ def _apply_fourier_falloff(ring: np.ndarray, center: np.ndarray,
         displacement = kernel[i] * ratio * delta_length
         # MIPAV: current.sub(delta) — move vertex AWAY from center by positive displacement
         out[idx] = vertex - radial_unit * displacement
+    return out
+
+
+# Sentinel n_samples value for the Gaussian (5-vertex weighted) edit mode.
+# Picked so the existing Fourier dispatch (n_samples ∈ {1,2,4,8,16,32}) is
+# untouched and so the value can still be stored in `cross_section_n_samples: int`.
+_GAUSSIAN_MODE = 0
+
+# Hardcoded weights from MIPAV's `quickGaussian` branch (LatticeModel.java:8511-8544).
+# Index = signed offset from the clicked vertex; weight ≈ exp(-offset²/2).
+_GAUSSIAN_WEIGHTS = {0: 1.0, -1: 0.37, 1: 0.37, -2: 0.14, 2: 0.14}
+
+
+def _apply_gaussian_falloff(ring: np.ndarray, center: np.ndarray,
+                            selected_vertex: int, delta_length: float,
+                            n_ellipse_pts: int = 32) -> np.ndarray:
+    """Apply MIPAV's `quickGaussian` 5-vertex weighted radial falloff.
+
+    Mirrors the dormant ``quickGaussian`` branch of LatticeModel.updateLattice
+    (LatticeModel.java:8511-8544; ``final boolean quickGaussian = false`` keeps
+    it disabled in MIPAV today). Only the clicked vertex and its ±1, ±2
+    neighbors move radially toward/away from ``center``:
+
+    - clicked vertex: ``1.0 × delta_length``
+    - vertex ± 1:     ``0.37 × delta_length`` (≈ 1/e)
+    - vertex ± 2:     ``0.14 × delta_length`` (≈ 1/e²)
+
+    All other vertices unchanged. Local 5-vertex bulge → smoother than the
+    Fourier-precalculated kernels at narrow widths (which can be spiky from
+    bandlimit ringing).
+
+    Parameters mirror :func:`_apply_fourier_falloff`. Returns a new array;
+    ``ring`` is not mutated.
+    """
+    out = ring.copy()
+    for offset, weight in _GAUSSIAN_WEIGHTS.items():
+        idx = (selected_vertex + offset) % n_ellipse_pts
+        vertex = out[idx]
+        radial = center - vertex
+        r_norm = np.linalg.norm(radial)
+        if r_norm < 1e-12:
+            continue
+        radial_unit = radial / r_norm
+        out[idx] = vertex - radial_unit * (weight * delta_length)
     return out
 
 
@@ -1714,7 +1769,8 @@ class DualViewWindow:
             cs_mode_group.setExclusive(True)
             cs_mode_buttons = {}
             for label, ns_val in (("Single (32)", 32), ("Narrow (16)", 16),
-                                  ("Medium (8)", 8), ("Wide (4)", 4)):
+                                  ("Medium (8)", 8), ("Wide (4)", 4),
+                                  ("Gaussian", _GAUSSIAN_MODE)):
                 btn = QPushButton(label)
                 btn.setCheckable(True)
                 if ns_val == 8:  # MIPAV default
@@ -1733,8 +1789,10 @@ class DualViewWindow:
 
             cs_hint = QLabel(
                 "Single: only clicked vertex · Narrow/Medium/Wide: Fourier "
-                "bulge around the click · all vertices move purely radially "
-                "from the ring center (MIPAV parity).")
+                "bulge around the click · Gaussian: 5-vertex weighted bulge "
+                "(clicked + ±1 at 0.37× + ±2 at 0.14×; smoother than narrow "
+                "Fourier kernels) · all vertices move purely radially from "
+                "the ring center (MIPAV parity).")
             cs_hint.setStyleSheet("color: #888; font-size: 10px;")
             cs_hint.setWordWrap(True)
             edit_layout.addWidget(cs_hint)
@@ -2348,6 +2406,7 @@ and reload automatically on next launch.
 <tr><td><b>Enable ring editing</b></td><td>Turn on Cmd+Click+Drag on wireframe ring vertices</td></tr>
 <tr><td><b>Single (32)</b></td><td>Only the clicked vertex moves (MIPAV "direct")</td></tr>
 <tr><td><b>Narrow (16) / Medium (8) / Wide (4)</b></td><td>Fourier-kernel bulge: wider = more vertices affected</td></tr>
+<tr><td><b>Gaussian</b></td><td>5-vertex weighted bulge (clicked + ±1 at 0.37× + ±2 at 0.14×); smoother than narrow Fourier kernels</td></tr>
 <tr><td><b>Reset rings</b></td><td>Wipe overrides for both currently-displayed timepoints</td></tr>
 <tr><td><b>Cmd+Click+Drag</b></td><td>On a wireframe ring vertex: reshape that cross-section radially</td></tr>
 </table>
@@ -3110,7 +3169,8 @@ Auto-exits when timepoint changes. Powered by Caroline Malin-Mayor's
         center = centers[ring_idx]
         current_ring = rings[ring_idx].copy()
         n_samples = self.cross_section_n_samples
-        mode_name = {32: 'Single', 16: 'Narrow', 8: 'Medium', 4: 'Wide'}.get(
+        mode_name = {32: 'Single', 16: 'Narrow', 8: 'Medium', 4: 'Wide',
+                     _GAUSSIAN_MODE: 'Gaussian'}.get(
             n_samples, f'n={n_samples}')
         print(f"[ring-edit t={timepoint}] Ring {ring_idx}, vertex {vert_idx}, "
               f"mode={mode_name}")
@@ -3133,8 +3193,12 @@ Auto-exits when timepoint changes. Powered by Caroline Malin-Mayor's
                     ray_pt = _project_point_on_ray(current_vertex, near2, far2)
                     new_radius = float(np.dot(ray_pt - center, radial_unit))
                     delta_length = new_radius - r_norm
-                    current_ring = _apply_fourier_falloff(
-                        current_ring, center, vert_idx, delta_length, n_samples)
+                    if n_samples == _GAUSSIAN_MODE:
+                        current_ring = _apply_gaussian_falloff(
+                            current_ring, center, vert_idx, delta_length)
+                    else:
+                        current_ring = _apply_fourier_falloff(
+                            current_ring, center, vert_idx, delta_length, n_samples)
                     # Persist as center-relative override
                     self.cross_section_overrides.setdefault(
                         timepoint, {})[ring_idx] = current_ring - center
@@ -3148,6 +3212,28 @@ Auto-exits when timepoint changes. Powered by Caroline Malin-Mayor's
             lat_l_ref, lat_r_ref, lat_lines_ref,
             lat_mid_ref, lat_lc_ref, lat_rc_ref)
         print(f"[ring-edit t={timepoint}] Released ring {ring_idx}")
+
+    def _compute_per_ring_max_radii(self, ti: int, left_pts: np.ndarray,
+                                    right_pts: np.ndarray) -> np.ndarray | None:
+        """One outer-bound radius per lattice anchor (Mark, 2026-04-27).
+
+        Per-ring: max distance of the 32 cross-section vertices from the
+        midline center. Falls back to L/R half-distance when no override.
+        Returns None if there are no overrides for ``ti`` (preserves the
+        old global-extent path).
+        """
+        overrides = self.cross_section_overrides.get(ti)
+        if not overrides:
+            return None
+        n = len(left_pts)
+        radii = np.empty(n, dtype=np.float64)
+        for i in range(n):
+            off = overrides.get(i)
+            if off is not None:
+                radii[i] = float(np.max(np.linalg.norm(off, axis=1)))
+            else:
+                radii[i] = 0.5 * float(np.linalg.norm(right_pts[i] - left_pts[i]))
+        return radii
 
     def _on_preview_toggle(self, side: int, enabled: bool):
         """UI checkbox → enter/exit preview mode for one side."""
@@ -3189,7 +3275,12 @@ Auto-exits when timepoint changes. Powered by Caroline Malin-Mayor's
             volume = self._get_blended_volume(side)
             self._toast(f"Building straightened volume…")
             QApplication.processEvents()
-            straight, ap_values = model.straighten_volume(volume.astype(np.float32))
+            per_ring_radii = self._compute_per_ring_max_radii(
+                ti, left_pts[:n], right_pts[:n])
+            straight, ap_values = model.straighten_volume(
+                volume.astype(np.float32),
+                per_ring_max_radii=per_ring_radii,
+            )
         except Exception as exc:
             import traceback; traceback.print_exc()
             self._toast_persistent(f"Preview: straighten failed — {exc}")
@@ -3374,6 +3465,18 @@ Auto-exits when timepoint changes. Powered by Caroline Malin-Mayor's
 
         self.preview_mode_active[side] = True
         self._update_preview_status(side)
+
+        # Conflict resolution: preview is read-mostly. Force-disable lattice
+        # mode + ring editing if they were on, hide the wireframe, and grey
+        # out the conflicting controls on this side's panel.
+        if self.lattice_mode:
+            self._toggle_lattice_mode()
+        if self.cross_section_edit_mode:
+            self._on_cross_section_enable_changed(False)
+        if self.wireframe_visible:
+            self._toggle_wireframe()
+        self._set_preview_conflicts_enabled(side, False)
+
         viewer.reset_view()
         # Default view: AP axis runs horizontal across screen, DV vertical,
         # ML into/out of screen. Camera looks along ML (axis 2 = napari x).
@@ -3435,6 +3538,7 @@ Auto-exits when timepoint changes. Powered by Caroline Malin-Mayor's
         self.preview_extents[side] = None
         self.preview_mode_active[side] = False
         self._update_preview_status(side)
+        self._set_preview_conflicts_enabled(side, True)
 
         # Restore active layer selection — preview set selection.active to
         # the (now-removed) straightened image layer; if we don't reset it,
@@ -3541,6 +3645,33 @@ Auto-exits when timepoint changes. Powered by Caroline Malin-Mayor's
             print(f"[preview-click] EXCEPTION: {exc}")
             traceback.print_exc()
 
+    def _set_preview_conflicts_enabled(self, side: int, enabled: bool):
+        """Grey out controls that conflict with preview on the given side.
+
+        Preview is read-mostly (the straightened volume is built once from
+        the current lattice + cross-sections); changing lattice / wireframe
+        / ring-edit state while looking at it would either silently desync
+        or crash the click routing. Disable those controls on this side's
+        panel for the duration of preview, and re-enable on exit.
+        """
+        dw = getattr(self, 'dual_window', None)
+        if dw is None:
+            return
+        targets: list = []
+        for attr in ('_mode_ann_btns', '_mode_lat_btns',
+                     '_mode_wf_btns', '_mode_mesh_btns'):
+            btns = getattr(dw, attr, None)
+            if btns and side < len(btns) and btns[side] is not None:
+                targets.append(btns[side])
+        cs = getattr(dw, '_cs_controls', None)
+        if cs and side < len(cs) and cs[side] is not None:
+            targets.append(cs[side]['enable'])
+            for btn in cs[side]['modes'].values():
+                targets.append(btn)
+            targets.append(cs[side]['reset'])
+        for t in targets:
+            t.setEnabled(enabled)
+
     def _reset_preview_checkbox(self, side: int):
         """Uncheck the preview checkbox without re-triggering the toggle."""
         if not hasattr(self.dual_window, '_preview_controls'):
@@ -3569,7 +3700,15 @@ Auto-exits when timepoint changes. Powered by Caroline Malin-Mayor's
             ctrls['info'].setText("Status: off")
 
     def _on_cross_section_enable_changed(self, enabled: bool):
-        """UI checkbox → state. Mirror to both sides' checkboxes."""
+        """UI checkbox → state. Mirror to both sides' checkboxes.
+
+        Ring editing only works on top of Lattice mode + a visible Wireframe
+        (vertices live on the wireframe; Cmd+Click routing flows through
+        lattice mode). Auto-enable both when the user turns ring editing on
+        so they don't have to chase three separate buttons. When disabling,
+        we leave lattice/wireframe alone — the user may still want to keep
+        inspecting or placing lattice points.
+        """
         self.cross_section_edit_mode = bool(enabled)
         if hasattr(self, '_cs_controls'):
             for ctrls in self._cs_controls:
@@ -3580,6 +3719,11 @@ Auto-exits when timepoint changes. Powered by Caroline Malin-Mayor's
                     cb.blockSignals(True)
                     cb.setChecked(self.cross_section_edit_mode)
                     cb.blockSignals(False)
+        if enabled:
+            if not self.lattice_mode:
+                self._toggle_lattice_mode()
+            if not self.wireframe_visible:
+                self._toggle_wireframe()
         self._toast(f"Ring editing: {'ON' if enabled else 'OFF'}")
 
     def _on_cross_section_mode_changed(self, n_samples: int):
