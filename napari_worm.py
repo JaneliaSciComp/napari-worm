@@ -2411,14 +2411,14 @@ and reload automatically on next launch.
 <tr><td><b>Cmd+Click+Drag</b></td><td>On a wireframe ring vertex: reshape that cross-section radially</td></tr>
 </table>
 <p style="font-size: 11px; color: #888; margin-left: 4px;">
-Requires Lattice mode (L) and the wireframe to be visible (W). Each drag moves
-all 32 vertices of the selected ring purely radially from its center — matches
-MIPAV's editingCrossSections behavior (<code>LatticeModel.java:8492-8665</code>).
-While "Enable ring editing" is on, Cmd+Click is captured for ring editing only
-(a click that misses every vertex does nothing — matches MIPAV, which ignores
-lattice add calls while in editingCrossSections mode; see
-<code>LatticeModel.java:1001-1004</code>). Uncheck to return to lattice placement.
-Save with <b>S</b> or <b>Save All</b>.
+Enabling "Enable ring editing" auto-enables Lattice mode (L) and the wireframe (W)
+since both are required. Each drag moves all 32 vertices of the selected ring
+purely radially from its center — matches MIPAV's editingCrossSections behavior
+(<code>LatticeModel.java:8492-8665</code>). While "Enable ring editing" is on,
+Cmd+Click is captured for ring editing only (a click that misses every vertex
+does nothing — matches MIPAV, which ignores lattice add calls while in
+editingCrossSections mode; see <code>LatticeModel.java:1001-1004</code>).
+Uncheck to return to lattice placement. Save with <b>S</b> or <b>Save All</b>.
 </p>
 
 <h3>Clipping (Clip tab)</h3>
@@ -2440,10 +2440,13 @@ Clip state is remembered per timepoint — each timepoint can have its own plane
 <tr><td><b>Cmd+Click</b></td><td>Place an annotation in straightened space; retwisted to twisted volume so it persists when preview toggles off</td></tr>
 </table>
 <p style="font-size: 11px; color: #888; margin-left: 4px;">
-Requires lattice with ≥3 pairs. Lattice + ring editing are disabled while preview is on.
-Auto-exits when timepoint changes. Powered by Caroline Malin-Mayor's
-<code>celegans_model</code> package — straighten + retwist run via
-<code>PythonCelegansModel</code>.
+Requires lattice with ≥3 pairs. Lattice / Wireframe / Mesh / Ring-edit controls
+are greyed out while preview is on (read-mostly). When cross-section ring overrides
+exist for the timepoint, each AP slice is sampled out to its own per-ring outer
+radius (max distance of the 32 cross-section vertices from the midline) — narrow
+regions stay tight, wide regions get more room. Auto-exits when timepoint changes.
+Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straighten
++ retwist run via <code>PythonCelegansModel</code>.
 </p>
 
 <h3>Tips</h3>
