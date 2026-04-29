@@ -1590,9 +1590,22 @@ class DualViewWindow:
             tables_layout.setContentsMargins(0, 0, 0, 0)
             tables_layout.setSpacing(4)
 
+            ann_header = QHBoxLayout()
             ann_label = QLabel("Annotations")
             ann_label.setStyleSheet("font-weight: bold; padding: 4px;")
-            tables_layout.addWidget(ann_label)
+            ann_header.addWidget(ann_label)
+            ann_header.addStretch()
+            new_ann_btn = QPushButton("New annotations")
+            new_ann_btn.setToolTip(
+                "Delete all annotation points for this timepoint, plus the "
+                "corresponding annotations.csv on disk.")
+            new_ann_btn.setStyleSheet(
+                "QPushButton { background-color: #c62828; color: white; "
+                "padding: 2px 6px; }")
+            new_ann_btn.clicked.connect(
+                lambda _, s=side: self._annotator._new_annotations(s))
+            ann_header.addWidget(new_ann_btn)
+            tables_layout.addLayout(ann_header)
             ann_table = QTableWidget(0, 6)
             ann_table.setHorizontalHeaderLabels(["Name", "X", "Y", "Z", "Intensity", "Seg"])
             ann_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -1613,6 +1626,17 @@ class DualViewWindow:
             group_filter.currentTextChanged.connect(
                 lambda text, s=side: self._annotator._on_group_filter_changed(s, text))
             lat_header.addWidget(group_filter)
+            new_lat_btn = QPushButton("New lattice")
+            new_lat_btn.setToolTip(
+                "Delete all lattice points and ring overrides for this "
+                "timepoint, plus the corresponding lattice.csv and "
+                "latticeCrossSection_*.csv files on disk.")
+            new_lat_btn.setStyleSheet(
+                "QPushButton { background-color: #c62828; color: white; "
+                "padding: 2px 6px; }")
+            new_lat_btn.clicked.connect(
+                lambda _, s=side: self._annotator._new_lattice(s))
+            lat_header.addWidget(new_lat_btn)
             tables_layout.addLayout(lat_header)
 
             if not hasattr(self, '_group_filters'):
@@ -2365,7 +2389,13 @@ class WormAnnotator:
 <tr><td><b>S</b> / <b>Cmd+S</b></td><td>Save annotations + lattice</td></tr>
 <tr><td><b>L</b></td><td>Switch to Lattice mode</td></tr>
 <tr><td><b>Delete</b></td><td>Remove selected table row</td></tr>
+<tr><td><b>New annotations</b> button</td><td>Delete all annotation points for this timepoint <i>and</i> the corresponding <code>annotations.csv</code> on disk (confirm dialog)</td></tr>
+<tr><td><b>New lattice</b> button</td><td>Delete all lattice points + ring overrides for this timepoint <i>and</i> the corresponding <code>lattice.csv</code> + <code>latticeCrossSection_*.csv</code> on disk (confirm dialog)</td></tr>
 </table>
+<p style="font-size: 11px; color: #888; margin-left: 4px;">
+Saves write to <code>integrated_annotation/annotations.csv</code> and
+<code>lattice_final/lattice.csv</code> (MIPAV-canonical names).
+</p>
 
 <h3>Lattice Mode (press L)</h3>
 <table cellpadding="4">
@@ -3742,6 +3772,134 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
                     btn.setChecked(True)
                     btn.blockSignals(False)
 
+    def _new_annotations(self, side: int):
+        """Delete all annotation points for `side`'s current timepoint,
+        both in memory and on disk (integrated_annotation/annotations.csv).
+        Confirms before deleting.
+        """
+        if side >= len(self.grid_timepoints):
+            return
+        ti = self.grid_timepoints[side]
+        stem = self.tiff_files[ti].stem
+        ann_csv = (self.volume_path / stem / f"{stem}_results"
+                   / "integrated_annotation" / "annotations.csv")
+
+        reply = QMessageBox.question(
+            self.dual_window._host,
+            "New annotations",
+            f"Delete all annotation points for t={ti}?\n\n"
+            f"Will also delete on disk:\n"
+            f"  {ann_csv}\n\n"
+            "This cannot be undone.",
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        pts_layer = self.grid_points_layers[side]
+        if pts_layer is not None:
+            pts_layer.data = np.empty((0, 3))
+
+        self.grid_annotations.pop(ti, None)
+        self.grid_annotation_segments.pop(ti, None)
+        self.undo_stack = [
+            e for e in self.undo_stack if not (len(e) >= 1 and e[0] == ti)]
+
+        deleted = []
+        try:
+            if ann_csv.exists():
+                ann_csv.unlink()
+                deleted.append(str(ann_csv))
+        except OSError as e:
+            print(f"  WARNING: could not delete {ann_csv}: {e}")
+
+        self._refresh_annotation_table(side)
+        self._refresh_point_labels(side)
+        msg = (f"New annotations t={ti}: cleared in memory, "
+               f"deleted {len(deleted)} file(s)")
+        print(msg)
+        for p in deleted:
+            print(f"  removed {p}")
+        self._toast(msg)
+
+    def _new_lattice(self, side: int):
+        """Delete all lattice points + ring overrides for `side`'s current
+        timepoint, both in memory and the corresponding CSV files on disk
+        (lattice_final/lattice.csv and model_crossSections/
+        latticeCrossSection_*.csv). Confirms before deleting.
+        """
+        if side >= len(self.grid_timepoints):
+            return
+        ti = self.grid_timepoints[side]
+        stem = self.tiff_files[ti].stem
+        results_base = self.volume_path / stem / f"{stem}_results"
+        lat_csv = results_base / "lattice_final" / "lattice.csv"
+        cs_dir = results_base / "model_crossSections"
+
+        reply = QMessageBox.question(
+            self.dual_window._host,
+            "New lattice",
+            f"Delete all lattice points and ring overrides for t={ti}?\n\n"
+            f"Will also delete on disk:\n"
+            f"  {lat_csv}\n"
+            f"  {cs_dir}/latticeCrossSection_*.csv\n\n"
+            "This cannot be undone.",
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        lat_l = self.lattice_left_layers[side]
+        lat_r = self.lattice_right_layers[side]
+        if lat_l is not None:
+            lat_l.data = np.empty((0, 3))
+        if lat_r is not None:
+            lat_r.data = np.empty((0, 3))
+
+        self.lattice_annotations.pop(ti, None)
+        self.lattice_pair_names.pop(ti, None)
+        self.lattice_seam_counter.pop(ti, None)
+        self.cross_section_overrides.pop(ti, None)
+        self.lattice_last_placed = None
+        self.lattice_undo_stack = [
+            e for e in self.lattice_undo_stack if not (len(e) >= 2 and e[1] == ti)]
+
+        if lat_l is not None and lat_r is not None:
+            self._update_lattice_visuals(
+                lat_l, lat_r,
+                self.lattice_line_layers[side],
+                self.lattice_mid_layers[side],
+                self.lattice_left_curve_layers[side],
+                self.lattice_right_curve_layers[side])
+
+        deleted = []
+        try:
+            if lat_csv.exists():
+                lat_csv.unlink()
+                deleted.append(str(lat_csv))
+        except OSError as e:
+            print(f"  WARNING: could not delete {lat_csv}: {e}")
+        if cs_dir.exists():
+            import re
+            for f in cs_dir.glob("latticeCrossSection_*.csv"):
+                if re.match(r"latticeCrossSection_\d+\.csv", f.name):
+                    try:
+                        f.unlink()
+                        deleted.append(str(f))
+                    except OSError as e:
+                        print(f"  WARNING: could not delete {f}: {e}")
+
+        self._refresh_tables()
+        self._refresh_point_labels(side)
+        msg = (f"New lattice t={ti}: cleared in memory, "
+               f"deleted {len(deleted)} file(s)")
+        print(msg)
+        for p in deleted:
+            print(f"  removed {p}")
+        self._toast(msg)
+
     def _reset_cross_sections_current(self):
         """Wipe cross-section overrides for both currently-displayed
         timepoints and rebuild wireframe/surface. Stale CSVs on disk will
@@ -3791,7 +3949,7 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
         return len(loaded)
 
     def _load_lattice_from_disk(self, ti: int) -> bool:
-        """Read lattice_final/lattice_test.csv for ti and repopulate
+        """Read lattice_final/lattice.csv for ti and repopulate
         self.lattice_annotations[ti] + self.lattice_pair_names[ti].
         No-op if ti already has an in-memory entry or no file exists.
         """
@@ -3801,7 +3959,7 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
             return False
         stem = self.tiff_files[ti].stem
         path = (self.volume_path / stem / f"{stem}_results"
-                / "lattice_final" / "lattice_test.csv")
+                / "lattice_final" / "lattice.csv")
         if not path.exists():
             return False
         try:
@@ -3846,7 +4004,7 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
         return True
 
     def _load_annotations_from_disk(self, ti: int) -> bool:
-        """Read integrated_annotation/annotations_test.csv for ti and repopulate
+        """Read integrated_annotation/annotations.csv for ti and repopulate
         self.grid_annotations[ti] + segments. No-op if already cached or absent.
         """
         if ti in self.grid_annotations and len(self.grid_annotations[ti]) > 0:
@@ -3855,7 +4013,7 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
             return False
         stem = self.tiff_files[ti].stem
         path = (self.volume_path / stem / f"{stem}_results"
-                / "integrated_annotation" / "annotations_test.csv")
+                / "integrated_annotation" / "annotations.csv")
         if not path.exists():
             return False
         try:
@@ -4582,7 +4740,7 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
             stem = self.tiff_files[ti].stem
             lat_dir = self.volume_path / stem / f"{stem}_results" / "lattice_final"
             lat_dir.mkdir(parents=True, exist_ok=True)
-            save_path = lat_dir / "lattice_test.csv"
+            save_path = lat_dir / "lattice.csv"
             self._save_csv_retry(pd.DataFrame(rows), save_path)
             print(f"  Lattice t={ti}: {len(rows)} points → {save_path}")
             saved_paths.append(str(save_path))
@@ -4626,7 +4784,7 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
                 ann_dir.mkdir(parents=True, exist_ok=True)
                 segs = self.grid_annotation_segments.get(ti, [])
                 ann_saved = save_annotations(
-                    pts, ann_dir / "annotations_test.csv", segments=segs)
+                    pts, ann_dir / "annotations.csv", segments=segs)
 
             entry = self.lattice_annotations.get(ti, {})
             left  = entry.get('left',  np.empty((0, 3)))
@@ -4655,7 +4813,7 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
                 lat_dir = results_base / "lattice_final"
                 lat_dir.mkdir(parents=True, exist_ok=True)
                 lat_saved = self._save_csv_retry(
-                    pd.DataFrame(rows), lat_dir / "lattice_test.csv")
+                    pd.DataFrame(rows), lat_dir / "lattice.csv")
 
             # Cross-section overrides (MIPAV model_crossSections/)
             cs_saved = self._save_cross_sections_for_timepoint(ti)
@@ -5053,7 +5211,7 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
                     ann_dir = (self.volume_path / stem / f"{stem}_results"
                                / "integrated_annotation")
                     ann_dir.mkdir(parents=True, exist_ok=True)
-                    save_path = ann_dir / "annotations_test.csv"
+                    save_path = ann_dir / "annotations.csv"
                     segs = self.grid_annotation_segments.get(ti, [])
                     if save_annotations(pts, save_path, segments=segs):
                         total += len(pts)

@@ -24,7 +24,8 @@ Developed at the **Shroff Lab**, Janelia Research Campus.
 - **Dual-view navigation**: NEXT/BACK buttons (and `]`/`[`) advance the sliding-window pair with auto-save of annotations for currently displayed timepoints before moving — matches MIPAV's `PlugInDialogVolumeRenderDual` workflow.
 - **Threshold slider**: Global lower-contrast-limit slider in the layer-controls area, synced across both viewers and all channels. Non-destructive (adjusts contrast_limits, not data).
 - **Preview mode (straightening)**: Preview tab → "Enable straightened view" resamples the twisted volume into a straightened tube using the lattice. Output axes are `Z=AP` (head→tail), `Y=DV`, `X=ML`. Cmd+Click in this view places annotations; positions are mapped back to twisted-pixel space via retwist so they persist when preview toggles off and save in the original coordinate system. When cross-section ring overrides exist for the timepoint, each AP slice is sampled out to its own per-ring outer-bound radius (max distance of the 32 cross-section vertices from the midline center) instead of a single global extent — narrower regions stay tight, wider regions get more room. Lattice/Wireframe/Ring-edit controls are greyed out while preview is on (read-mostly). Auto-exits on timepoint change. All worm-space math (splines, basis vectors, `straighten_volume`, `retwist`) runs in [Caroline Malin-Mayor's `celegans_model` package](https://github.com/ShroffLab/pyShroffCelegansModels) — napari-worm is a UI shell on top.
-- **MIPAV-compatible output**: Saves per-timepoint with 1-indexed naming matching MIPAV exactly: annotations as `A1, A2, ...` in `annotations_test.csv`, lattice in `lattice_test.csv`, cross-section overrides as `latticeCrossSection_1.csv` through `latticeCrossSection_<n>.csv` (no `_0`).
+- **MIPAV-compatible output**: Saves per-timepoint with 1-indexed naming matching MIPAV exactly: annotations as `A1, A2, ...` in `annotations.csv`, lattice in `lattice.csv`, cross-section overrides as `latticeCrossSection_1.csv` through `latticeCrossSection_<n>.csv` (no `_0`).
+- **Reset buttons**: "New annotations" and "New lattice" buttons in the Tables tab clear all points + ring overrides for the active timepoint and delete the corresponding CSV files on disk (with confirmation).
 - **Toast notifications**: In-app notifications for save confirmations, mode changes, and seam cell placement
 
 ## Quick Install (one command)
@@ -98,8 +99,8 @@ pixi run python napari_worm.py /path/to/RegB/ --no-grid
 Annotations and lattice data are saved per-timepoint in MIPAV-compatible CSV format (`name,x_voxels,y_voxels,z_voxels,R,G,B[,lattice_segment]`):
 
 ```
-RegB/Decon_reg_100/Decon_reg_100_results/integrated_annotation/annotations_test.csv
-RegB/Decon_reg_100/Decon_reg_100_results/lattice_final/lattice_test.csv
+RegB/Decon_reg_100/Decon_reg_100_results/integrated_annotation/annotations.csv
+RegB/Decon_reg_100/Decon_reg_100_results/lattice_final/lattice.csv
 RegB/Decon_reg_100/Decon_reg_100_results/model_crossSections/latticeCrossSection_<i>.csv
 ```
 
