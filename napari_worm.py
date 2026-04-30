@@ -497,6 +497,18 @@ def _find_closest_lattice_point_by_ray(near, far, left_pts, right_pts,
     return best
 
 
+def _find_closest_annotation_point_by_ray(near, far, pts, threshold=12.0):
+    """Closest annotation point to the camera ray. Returns (index, distance) or None."""
+    if len(pts) == 0:
+        return None
+    best = None
+    for i, pt in enumerate(pts):
+        dist = _point_to_ray_distance(pt, near, far)
+        if dist <= threshold and (best is None or dist < best[1]):
+            best = (i, dist)
+    return best
+
+
 def _segment_to_segment_distance(a0, a1, b0, b1):
     """Minimum distance between two 3D line segments a0→a1 and b0→b1.
 
@@ -529,51 +541,79 @@ def _segment_to_segment_distance(a0, a1, b0, b1):
     return np.linalg.norm(closest)
 
 
+def _closest_polyline_segment_to_ray(near: np.ndarray, far: np.ndarray,
+                                      pts: np.ndarray,
+                                      samples_per_segment: int = 20):
+    """Build the natural cubic spline through ``pts`` (same parametrization as
+    the rendered curve), sample it finely, and return ``(bracket_idx, dist)``
+    for the polyline segment closest to the camera ray. ``bracket_idx`` is the
+    control-point pair the closest sample falls between. Returns ``None`` if
+    fewer than 2 control points or degenerate geometry.
+    """
+    n = len(pts)
+    if n < 2:
+        return None
+    dists = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    cumlen = np.concatenate([[0.0], np.cumsum(dists)])
+    total = cumlen[-1]
+    if total < 1e-12:
+        return None
+    t_ctrl = cumlen / total
+    if n == 2:
+        polyline = pts
+        t_fine = t_ctrl
+    else:
+        cs = CubicSpline(t_ctrl, pts, axis=0, bc_type='natural')
+        n_samples = max((n - 1) * samples_per_segment + 1, 2)
+        t_fine = np.linspace(0.0, 1.0, n_samples)
+        polyline = cs(t_fine)
+
+    best_dist = float('inf')
+    best_seg = -1
+    for k in range(len(polyline) - 1):
+        d = _segment_to_segment_distance(near, far, polyline[k], polyline[k + 1])
+        if d < best_dist:
+            best_dist = d
+            best_seg = k
+    if best_seg < 0:
+        return None
+    t_mid = 0.5 * (t_fine[best_seg] + t_fine[best_seg + 1])
+    bracket = int(np.searchsorted(t_ctrl, t_mid, side='right')) - 1
+    bracket = max(0, min(bracket, n - 2))
+    return bracket, best_dist
+
+
 def _find_insertion_index(near: np.ndarray, far: np.ndarray,
                           left_pts: np.ndarray, right_pts: np.ndarray,
                           threshold: float = 12.0) -> tuple[int, str] | None:
-    """Find where to insert a new point between existing pairs.
+    """Find where to insert a new point between existing pairs by testing the
+    camera ray against the *displayed* L/R cubic-spline polylines (not just
+    the chord between adjacent control points). Returns (insert_index, side)
+    or None.
 
-    Matches MIPAV's addInsertionPoint(): measures the 3D distance from the
-    mouse RAY (near→far) to each left-curve segment and each right-curve
-    segment, then picks the closest segment within the threshold.
-
-    Returns
-    -------
-    (index, side) where index i means insert at position i+1, and side is
-    'L' or 'R' indicating which curve was clicked (closer to ray).
-    The clicked side gets the actual click position; the other side is
-    interpolated from neighbors. Returns None if no segment is close enough.
+    Diverges from MIPAV's addInsertionPoint (LatticeModel.java:6248-6300),
+    which only tests chords and has the same latent tail-curve bug.
     """
     n = min(len(left_pts), len(right_pts))
     if n < 2:
         return None
 
-    best_dist_l = float('inf')
-    best_idx_l = -1
-    for i in range(n - 1):
-        dist = _segment_to_segment_distance(near, far, left_pts[i], left_pts[i + 1])
-        if dist < best_dist_l and dist <= threshold:
-            best_dist_l = dist
-            best_idx_l = i
+    left_hit = _closest_polyline_segment_to_ray(near, far, left_pts[:n])
+    right_hit = _closest_polyline_segment_to_ray(near, far, right_pts[:n])
 
-    best_dist_r = float('inf')
-    best_idx_r = -1
-    for i in range(n - 1):
-        dist = _segment_to_segment_distance(near, far, right_pts[i], right_pts[i + 1])
-        if dist < best_dist_r and dist <= threshold:
-            best_dist_r = dist
-            best_idx_r = i
+    best_idx_l, best_dist_l = (-1, float('inf'))
+    if left_hit is not None and left_hit[1] <= threshold:
+        best_idx_l, best_dist_l = left_hit
 
-    # Match MIPAV: if both sides have a hit, pick the closer one
+    best_idx_r, best_dist_r = (-1, float('inf'))
+    if right_hit is not None and right_hit[1] <= threshold:
+        best_idx_r, best_dist_r = right_hit
+
     if best_idx_l != -1 and best_idx_r != -1:
-        if best_dist_l <= best_dist_r:
-            return (best_idx_l, 'L')
-        else:
-            return (best_idx_r, 'R')
-    elif best_idx_l != -1:
+        return (best_idx_l, 'L') if best_dist_l <= best_dist_r else (best_idx_r, 'R')
+    if best_idx_l != -1:
         return (best_idx_l, 'L')
-    elif best_idx_r != -1:
+    if best_idx_r != -1:
         return (best_idx_r, 'R')
     return None
 
@@ -1027,6 +1067,10 @@ class _ArrowKeyFilter(QObject):
             if ann.lattice_mode and ann.lattice_last_placed is not None:
                 ann._nudge_last_point(direction)
                 return True  # consume event — don't let napari rotate
+            elif (not ann.lattice_mode
+                  and ann.annotation_last_placed is not None):
+                ann._nudge_annotation_point(direction)
+                return True
             else:
                 # Navigate timepoints
                 if direction == 'right':
@@ -2140,6 +2184,7 @@ class WormAnnotator:
         self.surface_visible: bool = False
         self.lattice_next_side: str = 'L'  # alternates L→R→L→R (nose to tail)
         self.lattice_last_placed: dict | None = None  # {'side_idx', 'timepoint', 'layer', 'char'}
+        self.annotation_last_placed: dict | None = None
 
         # Cross-section overrides — per timepoint, per ring-index, center-relative
         # (num_ellipse_pts, 3) offsets. Mirrors MIPAV's relativeCrossSections
@@ -2571,6 +2616,8 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
         self.viewer_left.layers.clear()
         self.viewer_right.layers.clear()
         self.grid_timepoints = [t_left, t_right]
+        self.annotation_last_placed = None
+        self.lattice_last_placed = None
 
         # Repopulate in-memory caches from disk for any timepoint we haven't
         # touched this session. Matches MIPAV's behavior of picking up previously
@@ -2700,8 +2747,8 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
                     if 'Control' not in event.modifiers:
                         return
                     if not self.lattice_mode:
-                        self._on_click_dual(img_ref, event,
-                                            side_idx, timepoint, pts_ref)
+                        yield from self._on_click_dual(
+                            img_ref, event, side_idx, timepoint, pts_ref)
                         return
 
                     near, far = img_ref.get_ray_intersections(
@@ -4311,8 +4358,8 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
         segs = self.grid_annotation_segments.get(ti, [])
         if row < len(segs):
             segs.pop(row)
-        # Push undo
         self.undo_stack.append(('DELETE_ANN', ti, side, row, old_data[row].copy()))
+        self.annotation_last_placed = None
         print(f"[t={ti}] Deleted annotation A{row + 1}")
         self._refresh_annotation_table(side)
 
@@ -4872,11 +4919,52 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
             event.position, event.view_direction, event.dims_displayed)
         if near is None or far is None:
             return
+
+        if points_layer is not None and len(points_layer.data) > 0:
+            closest = _find_closest_annotation_point_by_ray(
+                near, far, np.asarray(points_layer.data), threshold=12.0)
+            if closest is not None:
+                pt_idx, _ = closest
+                self.annotation_last_placed = {
+                    'side_idx': side_idx, 'timepoint': timepoint,
+                    'layer': points_layer, 'index': pt_idx}
+                print(f"[t={timepoint}] Selected A{pt_idx + 1} "
+                      "(drag to move, arrows to nudge)")
+
+                yield
+
+                dragged = False
+                while event.type == 'mouse_move':
+                    if 'Control' not in event.modifiers:
+                        break
+                    dragged = True
+                    near2, far2 = layer.get_ray_intersections(
+                        event.position, event.view_direction, event.dims_displayed)
+                    if near2 is not None and far2 is not None:
+                        new_peak = self._find_peak_multi_channel(near2, far2, side_idx)
+                        new_pos = find_nucleus_centroid(
+                            self._get_blended_volume(side_idx), new_peak)
+                        pts = points_layer.data.copy()
+                        pts[pt_idx] = new_pos
+                        points_layer.data = pts
+                        self._refresh_point_labels(side_idx)
+                    yield
+
+                self.grid_annotations[timepoint] = points_layer.data.copy()
+                if dragged:
+                    print(f"[t={timepoint}] Released A{pt_idx + 1}")
+                    self._refresh_annotation_table(side_idx)
+                return
+
         peak = self._find_peak_multi_channel(near, far, side_idx)
         pos = find_nucleus_centroid(self._get_blended_volume(side_idx), peak)
         points_layer.add(pos)
         self.undo_stack.append((timepoint, points_layer))
         self.grid_annotation_segments.setdefault(timepoint, []).append(-1)
+        self.annotation_last_placed = {
+            'side_idx': side_idx, 'timepoint': timepoint,
+            'layer': points_layer,
+            'index': len(points_layer.data) - 1}
         label = "left" if side_idx == 0 else "right"
         print(f"[t={timepoint} {label}] Added at z={pos[0]:.1f} y={pos[1]:.1f} x={pos[2]:.1f}")
         self._refresh_annotation_table(side_idx)
@@ -5075,10 +5163,48 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
     # Arrow-key nudge & lattice done                                       #
     # ------------------------------------------------------------------ #
 
-    def _nudge_last_point(self, direction: str, step: float = 1.0):
-        """Move the selected/last-placed lattice point by 1 voxel.
+    def _screen_aligned_delta(self, viewer, direction: str,
+                              step: float = 1.0) -> np.ndarray:
+        """Return a (z, y, x) world-space delta of length ``step`` aligned to
+        the active viewer's screen axes:
+            up/down   → ± camera.up_direction
+            right/left → ± cross(up_direction, view_direction) (screen-right)
 
-        Matches MIPAV's moveSelectedPoint() — adds direction vector to point.
+        Falls back to world (z, x) axes if camera vectors are degenerate.
+        """
+        try:
+            view_dir = np.asarray(viewer.camera.view_direction, dtype=float)
+            up_dir = np.asarray(viewer.camera.up_direction, dtype=float)
+        except Exception:
+            view_dir = np.array([1.0, 0.0, 0.0])
+            up_dir = np.array([-1.0, 0.0, 0.0])
+        n_up = np.linalg.norm(up_dir)
+        n_view = np.linalg.norm(view_dir)
+        if n_up < 1e-9 or n_view < 1e-9:
+            # Fallback: legacy world-axis behavior
+            if direction == 'up':    return np.array([-step, 0.0, 0.0])
+            if direction == 'down':  return np.array([+step, 0.0, 0.0])
+            if direction == 'left':  return np.array([0.0, 0.0, -step])
+            if direction == 'right': return np.array([0.0, 0.0, +step])
+            return np.zeros(3)
+        up_dir = up_dir / n_up
+        view_dir = view_dir / n_view
+        right_dir = np.cross(up_dir, view_dir)
+        n_right = np.linalg.norm(right_dir)
+        if n_right < 1e-9:
+            right_dir = np.array([0.0, 0.0, 1.0])
+        else:
+            right_dir = right_dir / n_right
+        if direction == 'up':    return  step * up_dir
+        if direction == 'down':  return -step * up_dir
+        if direction == 'right': return  step * right_dir
+        if direction == 'left':  return -step * right_dir
+        return np.zeros(3)
+
+    def _nudge_last_point(self, direction: str, step: float = 1.0):
+        """Move the selected/last-placed lattice point by 1 voxel along the
+        active viewer's screen axes (so Up always moves visually up regardless
+        of view rotation).
         """
         if not self.lattice_mode:
             return
@@ -5088,23 +5214,20 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
         layer = info['layer']
         if len(layer.data) == 0:
             return
-        # Use specific index if set (selected existing point), else last point
         idx = info.get('index', len(layer.data) - 1)
         if idx >= len(layer.data):
             return
+        side_idx = info.get('side_idx', 0)
+        viewer = self.viewer_left if side_idx == 0 else self.viewer_right
+        delta = self._screen_aligned_delta(viewer, direction, step)
         pts = layer.data.copy()
-        # directions map to z/y/x axes: up/down = z, left/right = x
-        if direction == 'up':
-            pts[idx][0] -= step   # z decreases (visually "up")
-        elif direction == 'down':
-            pts[idx][0] += step
-        elif direction == 'left':
-            pts[idx][2] -= step   # x decreases
-        elif direction == 'right':
-            pts[idx][2] += step
+        pts[idx] = pts[idx] + delta
         layer.data = pts
-        # Update visuals
         ti = info['timepoint']
+        self._nudge_visuals_after_lattice(ti, layer)
+        return
+
+    def _nudge_visuals_after_lattice(self, ti, layer):
         for ll, lr, llines, lmid, llc, lrc in zip(
                 self.lattice_left_layers, self.lattice_right_layers,
                 self.lattice_line_layers, self.lattice_mid_layers,
@@ -5123,6 +5246,29 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
                 entry['right'] = layer.data.copy()
                 break
         self._refresh_tables()
+
+    def _nudge_annotation_point(self, direction: str, step: float = 1.0):
+        if self.lattice_mode:
+            return
+        info = self.annotation_last_placed
+        if info is None:
+            return
+        layer = info['layer']
+        if layer is None or len(layer.data) == 0:
+            return
+        idx = info.get('index', len(layer.data) - 1)
+        if idx >= len(layer.data):
+            return
+        side_idx = info.get('side_idx', 0)
+        viewer = self.viewer_left if side_idx == 0 else self.viewer_right
+        delta = self._screen_aligned_delta(viewer, direction, step)
+        pts = layer.data.copy()
+        pts[idx] = pts[idx] + delta
+        layer.data = pts
+        ti = info['timepoint']
+        self.grid_annotations[ti] = layer.data.copy()
+        self._refresh_point_labels(side_idx)
+        self._refresh_annotation_table(side_idx)
 
     def _toggle_wireframe(self):
         """Toggle wireframe mesh visibility. Rebuilds mesh when turning on."""
