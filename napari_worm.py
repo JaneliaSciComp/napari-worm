@@ -13,6 +13,7 @@ Usage:
 """
 
 import argparse
+import re
 from pathlib import Path
 
 import dask.array as da
@@ -451,10 +452,17 @@ def _renumber_lattice_pairs(pair_infos: list[dict]) -> list[dict]:
     Walks through pairs nose→tail, numbering seam and non-seam independently:
       - Non-seam:  a0, a1, a2, ...
       - Seam (≤10 total): H0, H1, H2, V1, V2, V3, V4, V5, V6, T
+
+    Pairs with ``custom_name=True`` (user-renamed) are skipped — their
+    name is preserved across structural edits. Auto-numbered slots advance
+    only for non-custom pairs, so the visible sequence stays consecutive
+    among auto names.
     """
     seam_count = 0
     lattice_count = 0
     for info in pair_infos:
+        if info.get('custom_name'):
+            continue
         if info['type'] == 'seam':
             if seam_count < len(_SEAM_CELL_SEQUENCE):
                 info['name'] = _SEAM_CELL_SEQUENCE[seam_count]
@@ -1794,6 +1802,42 @@ class DualViewWindow:
             clip_hint.setStyleSheet("color: #888; font-size: 10px;")
             clip_hint.setWordWrap(True)
             clip_layout.addWidget(clip_hint)
+
+            # Eye-aligned dual planes (MIPAV CLIP_EYE + CLIP_EYE_INV) —
+            # camera-following slab with independent near/far positions.
+            eye_hdr = QLabel("<b>Eye-aligned clipping</b> (follows camera)")
+            clip_layout.addWidget(eye_hdr)
+            eye_hint = QLabel(
+                "Near clips between you and the plane; "
+                "Far clips behind the plane. Both follow the camera as you rotate.")
+            eye_hint.setStyleSheet("color: #888; font-size: 10px;")
+            eye_hint.setWordWrap(True)
+            clip_layout.addWidget(eye_hint)
+
+            eye_near_enable = QCheckBox("Enable Near clip plane (toward observer)")
+            clip_layout.addWidget(eye_near_enable)
+            eye_near_frame = QCheckBox("Show Near plane frame")
+            clip_layout.addWidget(eye_near_frame)
+            near_row = QHBoxLayout()
+            near_lbl = QLabel("Near pos:")
+            near_lbl.setFixedWidth(70)
+            near_row.addWidget(near_lbl)
+            eye_near_pos = QLabeledDoubleSlider(Qt.Horizontal)
+            near_row.addWidget(eye_near_pos)
+            clip_layout.addLayout(near_row)
+
+            eye_far_enable = QCheckBox("Enable Far clip plane (away from observer)")
+            clip_layout.addWidget(eye_far_enable)
+            eye_far_frame = QCheckBox("Show Far plane frame")
+            clip_layout.addWidget(eye_far_frame)
+            far_row = QHBoxLayout()
+            far_lbl = QLabel("Far pos:")
+            far_lbl.setFixedWidth(70)
+            far_row.addWidget(far_lbl)
+            eye_far_pos = QLabeledDoubleSlider(Qt.Horizontal)
+            far_row.addWidget(eye_far_pos)
+            clip_layout.addLayout(far_row)
+
             clip_layout.addStretch()
 
             if not hasattr(self, '_clip_controls'):
@@ -1802,6 +1846,12 @@ class DualViewWindow:
                 'enable': clip_enable, 'frame': clip_frame_cb,
                 'position': clip_pos, 'thickness': clip_thk,
                 'reset': clip_reset,
+                'eye_near_enable': eye_near_enable,
+                'eye_near_frame': eye_near_frame,
+                'eye_near_position': eye_near_pos,
+                'eye_far_enable': eye_far_enable,
+                'eye_far_frame': eye_far_frame,
+                'eye_far_position': eye_far_pos,
             }
             # Wire controls → annotator state. Lambdas capture side via default arg.
             clip_enable.toggled.connect(
@@ -1814,6 +1864,19 @@ class DualViewWindow:
                 lambda v, s=side: self._annotator._on_clip_control_changed(s, 'thickness', float(v)))
             clip_reset.clicked.connect(
                 lambda _, s=side: self._annotator._reset_clip_plane(s))
+            # Eye-aligned signals
+            eye_near_enable.toggled.connect(
+                lambda v, s=side: self._annotator._on_clip_control_changed(s, 'eye_near_enabled', v))
+            eye_near_frame.toggled.connect(
+                lambda v, s=side: self._annotator._on_clip_control_changed(s, 'eye_near_frame', v))
+            eye_near_pos.valueChanged.connect(
+                lambda v, s=side: self._annotator._on_clip_control_changed(s, 'eye_near_position', float(v)))
+            eye_far_enable.toggled.connect(
+                lambda v, s=side: self._annotator._on_clip_control_changed(s, 'eye_far_enabled', v))
+            eye_far_frame.toggled.connect(
+                lambda v, s=side: self._annotator._on_clip_control_changed(s, 'eye_far_frame', v))
+            eye_far_pos.valueChanged.connect(
+                lambda v, s=side: self._annotator._on_clip_control_changed(s, 'eye_far_position', float(v)))
 
             # --- Edit tab: cross-section ring editing (MIPAV parity) ---
             edit_tab = QWidget()
@@ -2163,6 +2226,10 @@ class WormAnnotator:
 
         self.grid_annotations: dict[int, np.ndarray] = {}
         self.grid_annotation_segments: dict[int, list[int]] = {}  # parallel to grid_annotations, -1 = no lattice segment
+        # User-editable annotation names, parallel to grid_annotations. Default
+        # is f"A{i+1}" auto-numbered; Ryan groups by first letter (A*, B*, C*).
+        # Persisted to CSV `name` column; read back on cold reload.
+        self.grid_annotation_names: dict[int, list[str]] = {}
         self.undo_stack: list[tuple[int, object]] = []
         # For multi-channel: grid_image_layers[side] is a list of image layers (one per channel)
         self.grid_image_layers: list = [None, None]
@@ -2317,6 +2384,13 @@ class WormAnnotator:
         qt_left.canvas.native.installEventFilter(self._clip_drag_l)
         qt_right.canvas.native.installEventFilter(self._clip_drag_r)
 
+        # Eye-aligned clip planes follow viewer.camera.view_direction.
+        # Re-apply them on every camera angle change (gated to no-op if
+        # no eye-plane is enabled, so cost is one dict lookup per rotate).
+        for s, vw in ((0, self.viewer_left), (1, self.viewer_right)):
+            vw.camera.events.angles.connect(
+                lambda _ev, side=s: self._on_camera_rotated(side))
+
         # Show window FIRST so Qt initialises the GL context for both canvases,
         # then load layers.  If layers are added before the GL context exists,
         # vispy creates visuals without a valid context and the event→repaint
@@ -2434,6 +2508,7 @@ class WormAnnotator:
 <tr><td><b>S</b> / <b>Cmd+S</b></td><td>Save annotations + lattice</td></tr>
 <tr><td><b>L</b></td><td>Switch to Lattice mode</td></tr>
 <tr><td><b>Delete</b></td><td>Remove selected table row</td></tr>
+<tr><td><b>Rename in tables</b></td><td>Double-click the <b>Name</b> column (annotations) or <b>Pair</b> column (lattice) to rename. Non-blank and unique within the timepoint. Cmd+Z undoes. Custom lattice names persist across add/delete renumber.</td></tr>
 <tr><td><b>New annotations</b> button</td><td>Delete all annotation points for this timepoint <i>and</i> the corresponding <code>annotations.csv</code> on disk (confirm dialog)</td></tr>
 <tr><td><b>New lattice</b> button</td><td>Delete all lattice points + ring overrides for this timepoint <i>and</i> the corresponding <code>lattice.csv</code> + <code>latticeCrossSection_*.csv</code> on disk (confirm dialog)</td></tr>
 </table>
@@ -2498,15 +2573,20 @@ Uncheck to return to lattice placement. Save with <b>S</b> or <b>Save All</b>.
 
 <h3>Clipping (Clip tab)</h3>
 <table cellpadding="4">
-<tr><td><b>Enable arbitrary clip plane</b></td><td>Cut the volume with an arbitrary plane</td></tr>
+<tr><td><b>Enable arbitrary clip plane</b></td><td>Cut the volume with a user-rotatable plane</td></tr>
 <tr><td><b>Show plane frame</b></td><td>Display red rectangle at the plane position</td></tr>
 <tr><td><b>Position slider</b></td><td>Move plane along its normal (from volume center)</td></tr>
 <tr><td><b>Thickness slider</b></td><td>0 = single plane; &gt;0 = slab (show only region between two parallel planes)</td></tr>
-<tr><td><b>Shift+Drag on canvas</b></td><td>Rotate plane (only when frame is shown)</td></tr>
-<tr><td><b>Reset orientation</b></td><td>Restore X-axis default at volume center</td></tr>
+<tr><td><b>Shift+Drag on canvas</b></td><td>Rotate the arbitrary plane (only when its frame is shown)</td></tr>
+<tr><td><b>Reset orientation</b></td><td>Restore X-axis default at volume center; also zeros eye-plane positions</td></tr>
+<tr><td><b>Enable Near clip plane</b></td><td>Camera-aligned plane that clips between observer and plane (MIPAV CLIP_EYE)</td></tr>
+<tr><td><b>Enable Far clip plane</b></td><td>Camera-aligned plane that clips behind the plane (MIPAV CLIP_EYE_INV)</td></tr>
+<tr><td><b>Near/Far Pos sliders</b></td><td>Independent positions along the camera view direction</td></tr>
 </table>
 <p style="font-size: 11px; color: #888; margin-left: 4px;">
-Clip state is remembered per timepoint — each timepoint can have its own plane.
+Eye-aligned planes auto-follow the camera as you rotate the view; their normals
+re-sync continuously. Combine Near + Far to get a camera-aligned slab. Clip state
+is remembered per timepoint — each timepoint can have its own plane configuration.
 </p>
 
 <h3>Preview (Preview tab)</h3>
@@ -2966,6 +3046,17 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
             'position': 0.0,         # offset along normal from volume center, voxels
             'thickness': 0.0,        # 0 = single plane; >0 = slab (pair of planes)
             'frame_visible': False,
+            # Eye-aligned dual planes (camera-following). Mirrors MIPAV's
+            # CLIP_EYE + CLIP_EYE_INV (JPanelClip_WM.java:50-51): two planes
+            # whose normals follow viewer.camera.view_direction, with
+            # independent positions. Near = clips between observer and plane;
+            # Far = clips behind plane. Together = camera-aligned slab.
+            'eye_near_enabled': False,
+            'eye_near_position': 0.0,
+            'eye_near_frame': False,
+            'eye_far_enabled': False,
+            'eye_far_position': 0.0,
+            'eye_far_frame': False,
         }
 
     def _get_clip_state(self, side: int) -> dict:
@@ -3019,22 +3110,50 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
         if shape is None:
             return
         viewer = self.viewer_left if side == 0 else self.viewer_right
-        if not state['enabled']:
-            planes = []
-        else:
+        planes = []
+        if state['enabled']:
             position, normal = self._compute_clip_plane(state, shape)
-            planes = [{'position': tuple(position), 'normal': tuple(normal),
-                       'enabled': True}]
+            planes.append({'position': tuple(position), 'normal': tuple(normal),
+                           'enabled': True})
             if state['thickness'] > 0:
                 pos2 = position + normal * state['thickness']
                 planes.append({'position': tuple(pos2),
                                'normal': tuple(-normal), 'enabled': True})
+        # Eye-aligned planes (camera-following) — MIPAV CLIP_EYE / CLIP_EYE_INV.
+        # Independent from the arbitrary plane; can be active simultaneously.
+        if state['eye_near_enabled'] or state['eye_far_enabled']:
+            view_dir, center = self._eye_plane_basis(viewer, shape)
+            if view_dir is not None:
+                if state['eye_near_enabled']:
+                    p = center + view_dir * state['eye_near_position']
+                    planes.append({'position': tuple(p),
+                                   'normal': tuple(view_dir), 'enabled': True})
+                if state['eye_far_enabled']:
+                    p = center + view_dir * state['eye_far_position']
+                    planes.append({'position': tuple(p),
+                                   'normal': tuple(-view_dir), 'enabled': True})
         for layer in viewer.layers:
             if hasattr(layer, 'experimental_clipping_planes'):
                 try:
                     layer.experimental_clipping_planes = planes
                 except Exception:
                     pass  # some layer types may reject — silently skip
+
+    @staticmethod
+    def _eye_plane_basis(viewer, shape):
+        """Return (unit view_direction, volume center) or (None, None) if invalid.
+
+        view_direction is in napari (z, y, x); the eye-aligned plane normals
+        are derived from it. Center = shape/2 (volume midpoint).
+        """
+        try:
+            view_dir = np.asarray(viewer.camera.view_direction, dtype=float)
+        except Exception:
+            return None, None
+        norm = np.linalg.norm(view_dir)
+        if not np.isfinite(norm) or norm == 0:
+            return None, None
+        return view_dir / norm, np.array(shape) / 2.0
 
     def _set_volume_quality(self, side: int, hi: bool):
         """Swap volume ray-cast step size between drag (coarse) and idle (fine).
@@ -3071,23 +3190,40 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
         Uses in-place `data = [...]` assignment (relies on
         current_shape_type='polygon' set at layer creation) to avoid the
         remove_selected+add cycle which rebuilds vispy buffers.
+        Draws frames for the arbitrary plane (and its slab partner) plus
+        any enabled eye-aligned planes whose "Show frame" is on.
         """
         frame_layer = self.clip_frame_layers[side]
         if frame_layer is None:
             return
         state = self._get_clip_state(side)
         shape = self._volume_shape(side)
-        if shape is None or not (state['enabled'] and state['frame_visible']):
+        if shape is None:
+            return
+        show_arb = state['enabled'] and state['frame_visible']
+        show_eye_n = state['eye_near_enabled'] and state['eye_near_frame']
+        show_eye_f = state['eye_far_enabled'] and state['eye_far_frame']
+        if not (show_arb or show_eye_n or show_eye_f):
             if len(frame_layer.data) > 0:
                 frame_layer.data = []
             return
-        position, normal = self._compute_clip_plane(state, shape)
-        corners = self._plane_frame_corners(position, normal, shape)
-        shapes_data = [corners]
-        if state['thickness'] > 0:
-            pos2 = position + normal * state['thickness']
-            corners2 = self._plane_frame_corners(pos2, normal, shape)
-            shapes_data.append(corners2)
+        shapes_data = []
+        if show_arb:
+            position, normal = self._compute_clip_plane(state, shape)
+            shapes_data.append(self._plane_frame_corners(position, normal, shape))
+            if state['thickness'] > 0:
+                pos2 = position + normal * state['thickness']
+                shapes_data.append(self._plane_frame_corners(pos2, normal, shape))
+        if show_eye_n or show_eye_f:
+            viewer = self.viewer_left if side == 0 else self.viewer_right
+            view_dir, center = self._eye_plane_basis(viewer, shape)
+            if view_dir is not None:
+                if show_eye_n:
+                    p = center + view_dir * state['eye_near_position']
+                    shapes_data.append(self._plane_frame_corners(p, view_dir, shape))
+                if show_eye_f:
+                    p = center + view_dir * state['eye_far_position']
+                    shapes_data.append(self._plane_frame_corners(p, -view_dir, shape))
         frame_layer.data = shapes_data
 
     def _refresh_clip_ui(self, side: int):
@@ -3107,6 +3243,16 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
         ctrls['position'].setValue(state['position'])
         ctrls['thickness'].setRange(0, max_extent)
         ctrls['thickness'].setValue(state['thickness'])
+        # Eye-aligned controls (camera-following dual planes)
+        if 'eye_near_enable' in ctrls:
+            ctrls['eye_near_enable'].setChecked(state['eye_near_enabled'])
+            ctrls['eye_near_frame'].setChecked(state['eye_near_frame'])
+            ctrls['eye_near_position'].setRange(-max_extent / 2, max_extent / 2)
+            ctrls['eye_near_position'].setValue(state['eye_near_position'])
+            ctrls['eye_far_enable'].setChecked(state['eye_far_enabled'])
+            ctrls['eye_far_frame'].setChecked(state['eye_far_frame'])
+            ctrls['eye_far_position'].setRange(-max_extent / 2, max_extent / 2)
+            ctrls['eye_far_position'].setValue(state['eye_far_position'])
         for key, w in ctrls.items():
             if hasattr(w, 'blockSignals'):
                 w.blockSignals(False)
@@ -3117,11 +3263,29 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
         self._apply_clip_planes(side)
         self._update_clip_frame(side)
 
+    def _on_camera_rotated(self, side: int):
+        """Re-apply eye-aligned planes when the camera rotates.
+
+        Cheap no-op if no eye plane is active. Calls the flush path
+        directly (not the throttle) so the frame stays camera-perpendicular
+        during the drag instead of trailing by the throttle interval —
+        the throttle existed for Shift+Drag plane rotation, where we
+        coalesce 100+ mouse-moves per second; camera angles events fire
+        at a sane rate already, so the throttle just introduces visible
+        lag here.
+        """
+        state = self._get_clip_state(side)
+        if (state['eye_near_enabled'] or state['eye_far_enabled']
+                or state['eye_near_frame'] or state['eye_far_frame']):
+            self._flush_clip_refresh(side)
+
     def _reset_clip_plane(self, side: int):
         state = self._get_clip_state(side)
         state['rotation'] = np.eye(3)
         state['position'] = 0.0
         state['thickness'] = 0.0
+        state['eye_near_position'] = 0.0
+        state['eye_far_position'] = 0.0
         self._refresh_clip_ui(side)
         self._apply_clip_planes(side)
         self._update_clip_frame(side)
@@ -3348,25 +3512,49 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
         pair_names = self.lattice_pair_names.get(ti, [])
         names = [p['name'] for p in pair_names[:n]] if pair_names else None
 
+        # Gather visible channels (multi-channel-aware). Each visible channel
+        # gets its own straightened layer so colors are preserved in preview
+        # mode — matches the twisted view's additive overlay pattern.
+        img_layers = self.grid_image_layers[side]
+        if isinstance(img_layers, list):
+            channel_layers = [lyr for lyr in img_layers
+                              if lyr is not None and lyr.visible]
+            if not channel_layers:
+                channel_layers = [lyr for lyr in img_layers if lyr is not None]
+        else:
+            channel_layers = [img_layers] if img_layers is not None else []
+        if not channel_layers:
+            self._toast_persistent("Preview: no image layers to straighten.")
+            self._reset_preview_checkbox(side)
+            return
+
         try:
             model = _make_celegans_model(left_pts, right_pts, names)
             if model is None:
                 raise ValueError("model construction returned None")
-            volume = self._get_blended_volume(side)
-            self._toast(f"Building straightened volume…")
+            self._toast(f"Building straightened volume "
+                        f"({len(channel_layers)} channel"
+                        f"{'s' if len(channel_layers) > 1 else ''})…")
             QApplication.processEvents()
             per_ring_radii = self._compute_per_ring_max_radii(
                 ti, left_pts[:n], right_pts[:n])
-            straight, ap_values = model.straighten_volume(
-                volume.astype(np.float32),
-                per_ring_max_radii=per_ring_radii,
-            )
+            straight_channels = []
+            ap_values = None
+            for ch_layer in channel_layers:
+                vol = np.asarray(ch_layer.data).astype(np.float32)
+                straight, ap = model.straighten_volume(
+                    vol, per_ring_max_radii=per_ring_radii)
+                straight_channels.append(straight)
+                if ap_values is None:
+                    ap_values = ap
         except Exception as exc:
             import traceback; traceback.print_exc()
             self._toast_persistent(f"Preview: straighten failed — {exc}")
             self._reset_preview_checkbox(side)
             return
 
+        # Use first channel for layout — all channels share the same AP/DV/ML grid
+        straight = straight_channels[0]
         extent = (straight.shape[1] - 1) // 2
         self.preview_models[side] = model
         self.preview_ap_values[side] = ap_values
@@ -3380,12 +3568,25 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
                 layer.visible = False
         self.preview_hidden_layers[side] = hidden
 
-        contrast = (float(np.percentile(straight, 1.0)),
-                    float(np.percentile(straight, 99.5)))
-        img = viewer.add_image(
-            straight, name=f'Straightened t={ti}', colormap='gray',
-            blending='translucent', contrast_limits=list(contrast))
-        self.preview_image_layers[side] = img
+        # Add one preview image layer per channel. Multi-channel: use each
+        # channel's colormap + additive blending (matches twisted view).
+        # Single-channel: gray + translucent (unchanged from before).
+        preview_imgs = []
+        multi = len(straight_channels) > 1
+        for ch_layer, straight_vol in zip(channel_layers, straight_channels):
+            cmap = ch_layer.colormap.name if multi else 'gray'
+            blending = 'additive' if multi else 'translucent'
+            ch_name = ch_layer.name
+            contrast = (float(np.percentile(straight_vol, 1.0)),
+                        float(np.percentile(straight_vol, 99.5)))
+            preview_imgs.append(viewer.add_image(
+                straight_vol,
+                name=(f'Straightened {ch_name} t={ti}' if multi
+                      else f'Straightened t={ti}'),
+                colormap=cmap, blending=blending,
+                contrast_limits=list(contrast)))
+        img = preview_imgs[0]
+        self.preview_image_layers[side] = preview_imgs if multi else img
 
         # Project the lattice splines (L, R, center) into straightened space
         # so the user has the same midline + lattice overlays they're used to
@@ -3494,14 +3695,18 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
             if not self.preview_mode_active[side_idx]:
                 return
             preview_layer = self.preview_image_layers[side_idx]
+            if isinstance(preview_layer, list):
+                preview_layer = preview_layer[0] if preview_layer else None
             if preview_layer is None:
                 return
             self._on_preview_click(side_idx, preview_layer, event)
 
         # Layer-level only — viewer-level was a fallback that ended up firing
-        # the same event twice. The layer-level callback fires reliably as
-        # long as the straightened image is selected (we set it above).
-        img.mouse_drag_callbacks.append(_preview_click_handler)
+        # the same event twice. Register on EVERY preview channel layer so the
+        # click works regardless of which channel the user has selected in the
+        # layer list.
+        for ch_img in preview_imgs:
+            ch_img.mouse_drag_callbacks.append(_preview_click_handler)
         self.preview_click_callbacks[side] = _preview_click_handler
 
         try:
@@ -3581,22 +3786,38 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
         cb = self.preview_click_callbacks[side]
         if cb is not None:
             preview_layer = self.preview_image_layers[side]
-            if preview_layer is not None:
+            layers_to_unhook = (preview_layer if isinstance(preview_layer, list)
+                                else [preview_layer])
+            for lyr in layers_to_unhook:
+                if lyr is None:
+                    continue
                 try:
-                    preview_layer.mouse_drag_callbacks.remove(cb)
+                    lyr.mouse_drag_callbacks.remove(cb)
                 except (ValueError, AttributeError):
                     pass
             self.preview_click_callbacks[side] = None
 
-        for attr in ('preview_image_layers', 'preview_points_layers'):
-            layer = getattr(self, attr)[side]
-            if layer is not None:
-                try:
-                    if layer in viewer.layers:
-                        viewer.layers.remove(layer)
-                except Exception:
-                    pass
-            getattr(self, attr)[side] = None
+        # preview_image_layers may be a list (multi-channel) or a single
+        # layer (single-channel); remove every entry.
+        img_entry = self.preview_image_layers[side]
+        img_list = (img_entry if isinstance(img_entry, list)
+                    else ([img_entry] if img_entry is not None else []))
+        for layer in img_list:
+            try:
+                if layer in viewer.layers:
+                    viewer.layers.remove(layer)
+            except Exception:
+                pass
+        self.preview_image_layers[side] = None
+
+        pts_layer = self.preview_points_layers[side]
+        if pts_layer is not None:
+            try:
+                if pts_layer in viewer.layers:
+                    viewer.layers.remove(pts_layer)
+            except Exception:
+                pass
+        self.preview_points_layers[side] = None
 
         for layer in self.preview_overlay_layers[side]:
             try:
@@ -3850,6 +4071,7 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
 
         self.grid_annotations.pop(ti, None)
         self.grid_annotation_segments.pop(ti, None)
+        self.grid_annotation_names.pop(ti, None)
         self.undo_stack = [
             e for e in self.undo_stack if not (len(e) >= 1 and e[0] == ti)]
 
@@ -4036,8 +4258,14 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
                 left_pts.append(p['L'])
             if 'R' in p:
                 right_pts.append(p['R'])
-            ptype = 'seam' if prefix in _SEAM_CELL_SEQUENCE else 'lattice'
-            pair_infos.append({'name': prefix, 'type': ptype})
+            if prefix in _SEAM_CELL_SEQUENCE:
+                pair_infos.append({'name': prefix, 'type': 'seam'})
+            elif re.match(r'^a\d+$', prefix):
+                pair_infos.append({'name': prefix, 'type': 'lattice'})
+            else:
+                # User-renamed pair: preserve across future renumber calls
+                pair_infos.append({'name': prefix, 'type': 'lattice',
+                                   'custom_name': True})
         if not left_pts and not right_pts:
             return False
         self.lattice_annotations[ti] = {
@@ -4086,6 +4314,13 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
             self.grid_annotation_segments[ti] = segs
         else:
             self.grid_annotation_segments[ti] = [-1] * len(pts)
+        if 'name' in df.columns:
+            self.grid_annotation_names[ti] = [
+                str(v) if pd.notna(v) and str(v).strip() else f"A{i + 1}"
+                for i, v in enumerate(df['name'].tolist())
+            ]
+        else:
+            self.grid_annotation_names[ti] = [f"A{i + 1}" for i in range(len(pts))]
         print(f"  Annotations t={ti}: loaded {len(pts)} points from disk")
         return True
 
@@ -4106,12 +4341,17 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
         _text_style = dict(color='white', anchor='upper_left', size=8,
                            translation=[0, 0, 15])
 
-        # --- Annotation labels: A0, A1, ... ---
+        # --- Annotation labels: user-editable, default A1, A2, ... ---
         pts = self.grid_points_layers[side]
         if pts is not None:
             n = len(pts.data)
             if n > 0:
-                pts.properties = {'label': [f'A{i + 1}' for i in range(n)]}
+                ti = self.grid_timepoints[side] if side < len(self.grid_timepoints) else None
+                if ti is not None:
+                    labels = list(self._annotation_names(ti, n))
+                else:
+                    labels = [f'A{i + 1}' for i in range(n)]
+                pts.properties = {'label': labels}
                 pts.text = {**_text_style, 'string': 'label', 'color': 'white'}
             else:
                 pts.properties = {'label': []}
@@ -4140,6 +4380,17 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
                 layer.properties = {'label': []}
                 layer.text = None
 
+    def _annotation_names(self, ti: int, n: int) -> list[str]:
+        """Return the list of annotation names for ti, padded to length n.
+
+        Missing slots default to ``f"A{i+1}"``. Mutates the stored list in
+        place so subsequent reads see the same defaults.
+        """
+        names = self.grid_annotation_names.setdefault(ti, [])
+        if len(names) < n:
+            names.extend(f"A{i + 1}" for i in range(len(names), n))
+        return names
+
     def _refresh_annotation_table(self, side: int):
         """Populate annotation table from current points layer data."""
         table = self.dual_window.annotation_tables[side]
@@ -4155,6 +4406,7 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
         ti = self.grid_timepoints[side]
         data = np.asarray(pts_layer.data)
         segments = self.grid_annotation_segments.get(ti, [])
+        names = self._annotation_names(ti, len(data))
         table.setRowCount(len(data))
         # Get raw volume for intensity lookup (first image layer)
         img_layers = self.grid_image_layers[side]
@@ -4166,9 +4418,9 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
             raw_vol = None
         vol_shape = np.array(raw_vol.shape) if raw_vol is not None else None
         for i, (z, y, x) in enumerate(data):
-            # Name — read-only
-            name_item = QTableWidgetItem(f"A{i + 1}")
-            name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)
+            # Name — editable; user can override default A1/A2/… per Ryan's
+            # tissue-grouping workflow (A*, B*, C* by region).
+            name_item = QTableWidgetItem(names[i])
             table.setItem(i, 0, name_item)
             # X, Y, Z — editable
             table.setItem(i, 1, QTableWidgetItem(f"{x:.1f}"))
@@ -4225,10 +4477,11 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
         n_rows = max(len(l_data), len(r_data))
         table.setRowCount(n_rows)
         for i in range(n_rows):
-            # Pair name — read-only
+            # Pair name — editable; user-renamed pairs keep their name across
+            # add/delete renumbers (marked custom_name=True). Default scheme
+            # stays a0/a1/H0/H1/V1.. for auto-numbered slots.
             name = pair_names[i]['name'] if i < len(pair_names) else f"a{i}"
             name_item = QTableWidgetItem(name)
-            name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)
             table.setItem(i, 0, name_item)
             # L coords — editable
             if i < len(l_data):
@@ -4250,14 +4503,39 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
         table.blockSignals(False)
 
     def _on_annotation_table_edited(self, side: int, row: int, col: int):
-        """Handle user editing X/Y/Z or Seg columns in the annotation table."""
-        if col in (0, 4):  # Name and Intensity are read-only
+        """Handle user editing Name, X/Y/Z, or Seg columns in the annotation table."""
+        if col == 4:  # Intensity is read-only
             return
         table = self.dual_window.annotation_tables[side]
         item = table.item(row, col)
         if item is None:
             return
         text = item.text().strip()
+
+        if col == 0:  # Name column — validate non-blank, non-duplicate
+            ti = self.grid_timepoints[side]
+            pts_layer = self.grid_points_layers[side]
+            n = len(pts_layer.data) if pts_layer is not None else 0
+            names = self._annotation_names(ti, n)
+            old_name = names[row] if row < len(names) else f"A{row + 1}"
+            if text == old_name:
+                return
+            if not text:
+                self._toast("Annotation name cannot be blank")
+                table.blockSignals(True)
+                item.setText(old_name)
+                table.blockSignals(False)
+                return
+            if text in names[:row] + names[row + 1:]:
+                self._toast(f"Duplicate annotation name: {text}")
+                table.blockSignals(True)
+                item.setText(old_name)
+                table.blockSignals(False)
+                return
+            names[row] = text
+            self.undo_stack.append(('RENAME_ANN', ti, side, row, old_name))
+            self._refresh_point_labels(side)
+            return
 
         if col == 5:  # Seg column
             ti = self.grid_timepoints[side]
@@ -4295,13 +4573,43 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
         self.undo_stack.append(('TABLE_ANN', ti, side, row, old_val))
 
     def _on_lattice_table_edited(self, side: int, row: int, col: int):
-        """Handle user editing coordinate columns in the lattice table."""
-        if col == 0:  # Pair name is read-only
-            return
+        """Handle user editing Pair name or coordinate columns in the lattice table."""
         table = self.dual_window.lattice_tables[side]
         item = table.item(row, col)
         if item is None:
             return
+
+        if col == 0:  # Pair name — validate non-blank, non-duplicate; mark custom
+            ti = self.grid_timepoints[side]
+            pair_names = self.lattice_pair_names.setdefault(ti, [])
+            if row >= len(pair_names):
+                return
+            text = item.text().strip()
+            old_info = pair_names[row]
+            old_name = old_info['name']
+            old_custom = old_info.get('custom_name', False)
+            if text == old_name:
+                return
+            if not text:
+                self._toast("Lattice pair name cannot be blank")
+                table.blockSignals(True)
+                item.setText(old_name)
+                table.blockSignals(False)
+                return
+            other_names = [p['name'] for j, p in enumerate(pair_names) if j != row]
+            if text in other_names:
+                self._toast(f"Duplicate lattice pair name: {text}")
+                table.blockSignals(True)
+                item.setText(old_name)
+                table.blockSignals(False)
+                return
+            old_info['name'] = text
+            old_info['custom_name'] = True
+            self.lattice_undo_stack.append(
+                ('RENAME_LAT', ti, (row, old_name, old_custom)))
+            self._refresh_point_labels(side)
+            return
+
         try:
             val = float(item.text().strip())
         except ValueError:
@@ -4354,14 +4662,20 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
         ti = self.grid_timepoints[side]
         old_data = pts_layer.data.copy()
         pts_layer.data = np.delete(old_data, row, axis=0)
-        # Remove segment
+        # Remove segment + name
         segs = self.grid_annotation_segments.get(ti, [])
         if row < len(segs):
             segs.pop(row)
-        self.undo_stack.append(('DELETE_ANN', ti, side, row, old_data[row].copy()))
+        names = self.grid_annotation_names.get(ti, [])
+        deleted_name = names[row] if row < len(names) else f"A{row + 1}"
+        if row < len(names):
+            names.pop(row)
+        self.undo_stack.append(
+            ('DELETE_ANN', ti, side, row, old_data[row].copy(), deleted_name))
         self.annotation_last_placed = None
-        print(f"[t={ti}] Deleted annotation A{row + 1}")
+        print(f"[t={ti}] Deleted annotation {deleted_name}")
         self._refresh_annotation_table(side)
+        self._refresh_point_labels(side)
 
     def _delete_lattice_row(self, side: int):
         """Delete the selected lattice pair (both L and R)."""
@@ -4961,6 +5275,8 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
         points_layer.add(pos)
         self.undo_stack.append((timepoint, points_layer))
         self.grid_annotation_segments.setdefault(timepoint, []).append(-1)
+        new_name = f"A{len(points_layer.data)}"
+        self.grid_annotation_names.setdefault(timepoint, []).append(new_name)
         self.annotation_last_placed = {
             'side_idx': side_idx, 'timepoint': timepoint,
             'layer': points_layer,
@@ -4991,16 +5307,29 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
                 self._refresh_tables()
             return
 
+        # Handle rename undo
+        if isinstance(entry, tuple) and len(entry) >= 5 and entry[0] == 'RENAME_ANN':
+            _, ti, side, row, old_name = entry
+            names = self.grid_annotation_names.setdefault(ti, [])
+            if row < len(names):
+                names[row] = old_name
+            print(f"[t={ti}] Undid rename → {old_name}")
+            self._refresh_tables()
+            return
+
         # Handle delete annotation undo — re-insert the deleted point
         if isinstance(entry, tuple) and len(entry) >= 4 and entry[0] == 'DELETE_ANN':
-            _, ti, side, row, old_val = entry
+            _, ti, side, row, old_val = entry[:5]
+            old_name = entry[5] if len(entry) >= 6 else f"A{row + 1}"
             pts_layer = self.grid_points_layers[side]
             if pts_layer is not None:
                 pts = pts_layer.data.copy() if len(pts_layer.data) > 0 else np.empty((0, 3))
                 pts_layer.data = np.insert(pts, row, old_val, axis=0)
                 segs = self.grid_annotation_segments.setdefault(ti, [])
                 segs.insert(row, -1)
-                print(f"[t={ti}] Undid delete of A{row + 1}")
+                names = self.grid_annotation_names.setdefault(ti, [])
+                names.insert(row, old_name)
+                print(f"[t={ti}] Undid delete of {old_name}")
                 self._refresh_tables()
             return
 
@@ -5011,12 +5340,18 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
             segs = self.grid_annotation_segments.get(timepoint, [])
             if segs:
                 segs.pop()
+            names = self.grid_annotation_names.get(timepoint, [])
+            if names:
+                names.pop()
             print(f"[t={timepoint}] Undid last annotation")
         elif timepoint in self.grid_annotations and len(self.grid_annotations[timepoint]) > 0:
             self.grid_annotations[timepoint] = self.grid_annotations[timepoint][:-1]
             segs = self.grid_annotation_segments.get(timepoint, [])
             if segs:
                 segs.pop()
+            names = self.grid_annotation_names.get(timepoint, [])
+            if names:
+                names.pop()
             for side, ti in enumerate(self.grid_timepoints):
                 if ti == timepoint and side < len(self.grid_points_layers):
                     dp = self.grid_points_layers[side]
@@ -5037,6 +5372,19 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
         undo_entry = self.lattice_undo_stack.pop()
         side_char = undo_entry[0]
         timepoint = undo_entry[1]
+
+        if side_char == 'RENAME_LAT':
+            row, old_name, old_custom = undo_entry[2]
+            pair_names = self.lattice_pair_names.setdefault(timepoint, [])
+            if row < len(pair_names):
+                pair_names[row]['name'] = old_name
+                if old_custom:
+                    pair_names[row]['custom_name'] = True
+                else:
+                    pair_names[row].pop('custom_name', None)
+            print(f"[t={timepoint}] Undid lattice rename → {old_name}")
+            self._refresh_tables()
+            return
 
         if side_char == 'DELETE_LAT':
             # Undo a lattice pair deletion — re-insert
@@ -5359,7 +5707,8 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
                     ann_dir.mkdir(parents=True, exist_ok=True)
                     save_path = ann_dir / "annotations.csv"
                     segs = self.grid_annotation_segments.get(ti, [])
-                    if save_annotations(pts, save_path, segments=segs):
+                    nms = self._annotation_names(ti, len(pts))
+                    if save_annotations(pts, save_path, names=nms, segments=segs):
                         total += len(pts)
                         ann_paths.append(str(save_path))
                         print(f"  Saved {len(pts)} to {save_path}")
