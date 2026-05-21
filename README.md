@@ -48,11 +48,23 @@ This installs [Pixi](https://pixi.sh) (if needed), clones the repo, and sets up 
 
 ## Manual Installation
 
+For end users (recommended — pixi handles the napari + Qt env):
+
 ```bash
 git clone https://github.com/JaneliaSciComp/napari-worm.git
 cd napari-worm
 pixi install
 ```
+
+For downstream tool authors who want to `import napari_worm.geometry.*` etc. into their own project (e.g. for sharing mesh / IO / ray-sampling helpers):
+
+```bash
+pip install -e /path/to/napari-worm     # editable install
+# or pin to a specific commit:
+pip install "napari-worm @ git+https://github.com/JaneliaSciComp/napari-worm.git@<commit>"
+```
+
+After install, the CLI is available as `napari-worm` (in addition to `python -m napari_worm` and `python napari_worm.py`).
 
 ## Usage
 
