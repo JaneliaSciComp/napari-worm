@@ -59,13 +59,20 @@ class WormAnnotator:
     """Main annotation tool class."""
 
     def __init__(self, volume_path, annotations_path=None, grid_mode=True, start_t=0,
-                 channels=None):
+                 channels=None, downsample=None):
         self.volume_path = Path(volume_path)
         self.annotations_path = annotations_path
         self.is_time_series = self.volume_path.is_dir()
         self.use_grid = grid_mode and self.is_time_series
         self.start_t = start_t
         self.channels_arg = channels
+        self.downsample = downsample  # (fZ, fY, fX) or None
+        # napari scale for all layers: makes each downsampled voxel display at
+        # the correct physical size so annotations overlay the image correctly.
+        self.scale = tuple(downsample) if (downsample and any(f > 1 for f in downsample)) else None
+        if self.scale:
+            print(f"Downsampling Z×{downsample[0]} Y×{downsample[1]} X×{downsample[2]}"
+                  f" — axis order detected per TIFF metadata")
 
         if self.use_grid:
             self._init_dual_window_mode()
@@ -108,11 +115,13 @@ class WormAnnotator:
     # ------------------------------------------------------------------ #
 
     def _init_single_mode(self):
-        self.data = load_volume(self.volume_path)
+        self.data = load_volume(self.volume_path, downsample=self.downsample)
         self.image_layer = self.viewer.add_image(
-            self.data, name='Volume', colormap='gray', rendering='mip')
+            self.data, name='Volume', colormap='gray', rendering='mip',
+            scale=self.scale)
         self.points_layer = self.viewer.add_points(
-            ndim=3, name='Annotations', size=5, face_color='yellow')
+            ndim=3, name='Annotations', size=5, face_color='yellow',
+            scale=self.scale)
         self.image_layer.mouse_drag_callbacks.append(self._on_click_single)
 
     def _on_click_single(self, layer, event):
@@ -671,7 +680,7 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
             all_volumes = []
             for ch_idx, (ch_files, (_, ch_name, ch_cmap)) in enumerate(
                     zip(self.channel_tiff_files, self.channels)):
-                vol = load_volume(ch_files[ti])
+                vol = load_volume(ch_files[ti], downsample=self.downsample)
                 all_volumes.append(vol)
                 # Single channel → gray, no blending change; multi → colored + additive
                 if self.multi_channel:
@@ -692,7 +701,8 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
                 img = viewer_ref.add_image(
                     vol, name=layer_name, colormap=cmap,
                     rendering='mip', contrast_limits=clim,
-                    blending=blending, multiscale=False)
+                    blending=blending, multiscale=False,
+                    scale=self.scale)
                 channel_img_layers.append(img)
 
             # Surface layer: sits below all interactive layers so it never steals clicks
@@ -702,11 +712,13 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
             surface = viewer_ref.add_surface(
                 (empty_verts, empty_faces, empty_vals),
                 name='Surface', shading='smooth',
-                colormap='turbo', opacity=0.7)
+                colormap='turbo', opacity=0.7,
+                scale=self.scale)
             surface.interactive = False
             surface.visible = self.surface_visible
             pts = viewer_ref.add_points(
-                ndim=3, name='Annotations', size=5, face_color='yellow')
+                ndim=3, name='Annotations', size=5, face_color='yellow',
+                scale=self.scale)
             pts.mode = 'pan_zoom'  # prevent napari's native add-on-click
 
             if ti in self.grid_annotations and len(self.grid_annotations[ti]) > 0:
@@ -715,29 +727,37 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
             # Lattice layers: left (cyan squares), right (magenta squares), lines (yellow)
             lat_l = viewer_ref.add_points(
                 ndim=3, name='Lattice Left',  size=7,
-                face_color='cyan',    symbol='square')
+                face_color='cyan',    symbol='square',
+                scale=self.scale)
             lat_r = viewer_ref.add_points(
                 ndim=3, name='Lattice Right', size=7,
-                face_color='magenta', symbol='square')
+                face_color='magenta', symbol='square',
+                scale=self.scale)
             lat_lines = viewer_ref.add_shapes(
                 ndim=3, name='Lattice Lines',
-                edge_color='yellow', edge_width=1, face_color='transparent')
+                edge_color='yellow', edge_width=1, face_color='transparent',
+                scale=self.scale)
             lat_mid = viewer_ref.add_shapes(
                 ndim=3, name='Lattice Mid',
-                edge_color='red', edge_width=1, face_color='transparent')
+                edge_color='red', edge_width=1, face_color='transparent',
+                scale=self.scale)
             lat_left_curve = viewer_ref.add_shapes(
                 ndim=3, name='Lattice Left Curve',
-                edge_color='magenta', edge_width=1, face_color='transparent')
+                edge_color='magenta', edge_width=1, face_color='transparent',
+                scale=self.scale)
             lat_right_curve = viewer_ref.add_shapes(
                 ndim=3, name='Lattice Right Curve',
-                edge_color='green', edge_width=1, face_color='transparent')
+                edge_color='green', edge_width=1, face_color='transparent',
+                scale=self.scale)
             wireframe = viewer_ref.add_shapes(
                 ndim=3, name='Wireframe',
-                edge_color='white', edge_width=0.5, face_color='transparent')
+                edge_color='white', edge_width=0.5, face_color='transparent',
+                scale=self.scale)
             wireframe.visible = self.wireframe_visible
             clip_frame = viewer_ref.add_shapes(
                 ndim=3, name='Clip Frame',
-                edge_color='red', edge_width=1.0, face_color='transparent')
+                edge_color='red', edge_width=1.0, face_color='transparent',
+                scale=self.scale)
             clip_frame.interactive = False
             try:
                 clip_frame.current_shape_type = 'polygon'

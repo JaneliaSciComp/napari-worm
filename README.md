@@ -29,6 +29,7 @@ Developed at the **Shroff Lab**, Janelia Research Campus.
 - **MIPAV-compatible output**: Saves per-timepoint with 1-indexed naming matching MIPAV exactly: annotations as `A1, A2, ...` in `annotations.csv`, lattice in `lattice.csv`, cross-section overrides as `latticeCrossSection_1.csv` through `latticeCrossSection_<n>.csv` (no `_0`).
 - **Reset buttons**: "New annotations" and "New lattice" buttons in the Tables tab clear all points + ring overrides for the active timepoint and delete the corresponding CSV files on disk (with confirmation).
 - **Toast notifications**: In-app notifications for save confirmations, mode changes, and seam cell placement
+- **Volume downsampling**: `--downsample Z,Y,X` (e.g. `--downsample 1,2,2`) block-averages each axis by the given factor before display — useful for navigating large datasets (e.g. Xinyi's Pos7 488-channel ~2 GB/timepoint becomes ~53 MB). Axis order is detected from TIFF metadata (handles ImageJ `IYX` and standard `ZYX` labelling). All layers (image, annotations, lattice, wireframe, surface) share the same scale so annotations stay aligned. Also available as a "Downsample Z,Y,X" textbox in the GUI launch dialog; value remembered across sessions.
 
 ## Quick Install (one command)
 
@@ -87,6 +88,10 @@ pixi run python napari_worm.py /path/to/volume.tif -a annotations.csv
 
 # Dask 4D slider mode (fallback for large datasets):
 pixi run python napari_worm.py /path/to/RegB/ --no-grid
+
+# Downsample for large datasets (block-average Y and X by 2, keep Z full):
+pixi run python napari_worm.py /path/to/RegB/ --downsample 1,2,2 --start 0
+# Or enter "1,2,2" in the "Downsample Z,Y,X" field of the GUI launch dialog
 ```
 
 ## Keyboard Shortcuts

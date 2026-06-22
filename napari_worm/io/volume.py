@@ -6,13 +6,59 @@ import tifffile
 from dask import delayed
 
 
-def load_volume(path: str | Path) -> np.ndarray:
-    """Load a 3D TIFF volume."""
+def _block_mean(data: np.ndarray, factors: tuple) -> np.ndarray:
+    """Downsample by block-averaging. factors[i] is the factor for axis i."""
+    result = data
+    for ax, f in enumerate(factors):
+        if f <= 1:
+            continue
+        n = result.shape[ax]
+        n2 = (n // f) * f
+        idx = [slice(None)] * result.ndim
+        idx[ax] = slice(0, n2)
+        result = result[tuple(idx)]
+        shape = list(result.shape)
+        shape[ax] = n2 // f
+        shape.insert(ax + 1, f)
+        result = result.reshape(shape).mean(axis=ax + 1)
+    return result.astype(data.dtype)
+
+
+def _tiff_axes(path: Path) -> str:
+    """Return axis-order string from TIFF metadata; default 'ZYX' for 3-D."""
+    try:
+        with tifffile.TiffFile(str(path)) as tf:
+            if tf.series:
+                axes = tf.series[0].axes
+                if axes:
+                    return axes.upper()
+    except Exception:
+        pass
+    return 'ZYX'
+
+
+def load_volume(path: str | Path, downsample: tuple | None = None) -> np.ndarray:
+    """Load a 3D TIFF volume.
+
+    downsample=(fZ, fY, fX): block-average each spatial axis by that factor.
+    Axis order is detected from TIFF metadata so the factors apply to the
+    correct physical dimensions regardless of on-disk storage order.
+    """
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Volume not found: {path}")
+    axes = _tiff_axes(path)
     data = tifffile.imread(str(path))
-    print(f"Loaded volume: {path.name}  shape={data.shape}  dtype={data.dtype}")
+    print(f"Loaded volume: {path.name}  shape={data.shape}  axes={axes}  dtype={data.dtype}")
+    if downsample is not None and any(f > 1 for f in downsample):
+        fz, fy, fx = downsample
+        # Normalize common Z aliases (ImageJ uses 'I', some writers use 'Q'/'S')
+        _Z_ALIASES = {'I', 'Q', 'S'}
+        axis_factor = {c: fz for c in _Z_ALIASES}
+        axis_factor.update({'Z': fz, 'Y': fy, 'X': fx})
+        factors = tuple(axis_factor.get(c, 1) for c in axes)
+        data = _block_mean(data, factors)
+        print(f"  Downsampled Z×{fz} Y×{fy} X×{fx} → shape={data.shape}")
     return data
 
 
