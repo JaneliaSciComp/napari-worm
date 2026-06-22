@@ -20,12 +20,13 @@ class _ArrowKeyFilter(QObject):
         if event.type() == QEvent.KeyPress and event.key() in self._KEY_MAP:
             direction = self._KEY_MAP[event.key()]
             ann = self._annotator
+            step = 5.0 if (event.modifiers() & Qt.ShiftModifier) else 1.0
             if ann.lattice_mode and ann.lattice_last_placed is not None:
-                ann._nudge_last_point(direction)
+                ann._nudge_last_point(direction, step=step)
                 return True  # consume event — don't let napari rotate
             elif (not ann.lattice_mode
                   and ann.annotation_last_placed is not None):
-                ann._nudge_annotation_point(direction)
+                ann._nudge_annotation_point(direction, step=step)
                 return True
             else:
                 # Navigate timepoints

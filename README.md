@@ -106,8 +106,8 @@ pixi run python napari_worm.py /path/to/RegB/ --no-grid
 | `Shift+Drag` on canvas | Rotate arbitrary clip plane (when clip is enabled) |
 | `Cmd+Click+Drag` on wireframe vertex | Reshape cross-section ring (requires Lattice + Wireframe + "Enable ring editing") |
 | Double-click `Name` / `Pair` cell in table | Rename annotation or lattice pair (non-blank, unique within timepoint) |
-| `Cmd+Z` | Undo last action — annotation, lattice point, drag, rename, or table edit |
-| Arrow keys | Nudge selected lattice point by 1 voxel |
+| `Cmd+Z` (macOS) / `Ctrl+Z` (Win) | Undo last action — annotation, lattice point, drag, rename, or table edit |
+| Arrow keys | Nudge selected point by 1 voxel; `Shift+Arrow` = 5 voxels |
 
 ## Output Format
 

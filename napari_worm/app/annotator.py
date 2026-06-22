@@ -93,7 +93,7 @@ class WormAnnotator:
         print("  (lattice mode)    Cmd+Shift+Click = place Right lattice point")
         print("  Right / ]         : next timepoint pair")
         print("  Left  / [         : previous timepoint pair")
-        print("  Cmd+Z             : undo last annotation/lattice point")
+        print("  Cmd+Z / Ctrl+Z    : undo last annotation/lattice point")
         print("  S                 : save annotations + lattice")
         print("  W                 : toggle wireframe mesh")
         print("  Shift+W           : toggle surface mesh")
@@ -461,11 +461,11 @@ class WormAnnotator:
 <h3>Annotation Mode (default)</h3>
 <table cellpadding="4">
 <tr><td><b>Cmd+Click</b></td><td>Place annotation at peak intensity</td></tr>
-<tr><td><b>Cmd+Z</b></td><td>Undo last annotation</td></tr>
+<tr><td><b>Cmd+Z</b> (Mac) / <b>Ctrl+Z</b> (Win)</td><td>Undo last annotation</td></tr>
 <tr><td><b>S</b> / <b>Cmd+S</b></td><td>Save annotations + lattice</td></tr>
 <tr><td><b>L</b></td><td>Switch to Lattice mode</td></tr>
 <tr><td><b>Delete</b></td><td>Remove selected table row</td></tr>
-<tr><td><b>Rename in tables</b></td><td>Double-click the <b>Name</b> column (annotations) or <b>Pair</b> column (lattice) to rename. Non-blank and unique within the timepoint. Cmd+Z undoes. Custom lattice names persist across add/delete renumber.</td></tr>
+<tr><td><b>Rename in tables</b></td><td>Double-click the <b>Name</b> column (annotations) or <b>Pair</b> column (lattice) to rename. Non-blank and unique within the timepoint. Cmd+Z (macOS) / Ctrl+Z (Win) undoes. Custom lattice names persist across add/delete renumber.</td></tr>
 <tr><td><b>New annotations</b> button</td><td>Delete all annotation points for this timepoint <i>and</i> the corresponding <code>annotations.csv</code> on disk (confirm dialog)</td></tr>
 <tr><td><b>New lattice</b> button</td><td>Delete all lattice points + ring overrides for this timepoint <i>and</i> the corresponding <code>lattice.csv</code> + <code>latticeCrossSection_*.csv</code> on disk (confirm dialog)</td></tr>
 </table>
@@ -480,8 +480,8 @@ Saves write to <code>integrated_annotation/annotations.csv</code> and
 <tr><td><b>Cmd+Shift+Click</b></td><td>Place seam cell (L/R pair)</td></tr>
 <tr><td><b>Cmd+Click on point</b></td><td>Select point, then drag to move</td></tr>
 <tr><td><b>Cmd+Click on curve</b></td><td>Insert new pair between existing</td></tr>
-<tr><td><b>Arrow keys</b></td><td>Nudge selected point by 1 voxel</td></tr>
-<tr><td><b>Cmd+Z</b></td><td>Undo last lattice operation</td></tr>
+<tr><td><b>Arrow keys</b></td><td>Nudge selected point by 1 voxel; <b>Shift+Arrow</b> = 5 voxels</td></tr>
+<tr><td><b>Cmd+Z</b> (Mac) / <b>Ctrl+Z</b> (Win)</td><td>Undo last lattice operation</td></tr>
 <tr><td><b>D</b></td><td>Done — save and exit lattice mode</td></tr>
 <tr><td><b>L</b></td><td>Back to annotation mode</td></tr>
 </table>
@@ -3494,7 +3494,7 @@ Powered by Caroline Malin-Mayor's <code>celegans_model</code> package — straig
             return np.zeros(3)
         up_dir = up_dir / n_up
         view_dir = view_dir / n_view
-        right_dir = np.cross(up_dir, view_dir)
+        right_dir = np.cross(view_dir, up_dir)
         n_right = np.linalg.norm(right_dir)
         if n_right < 1e-9:
             right_dir = np.array([0.0, 0.0, 1.0])
